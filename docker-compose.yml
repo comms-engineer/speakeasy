@@ -1,0 +1,21 @@
+services:
+  speakeasy_hub:
+    build: .
+    container_name: speakeasy_hub_alpha
+    restart: unless-stopped
+    ports:
+      - "4965:4965/tcp"
+      - "4965:4965/udp"
+      - "4242:4242/udp"
+    volumes:
+      - ./data:/root/.reti_speakeasy
+      - ./reticulum_conf:/root/.reticulum
+      - ./speakeasy_config.json:/app/speakeasy_config.json:ro
+    environment:
+      - TZ=UTC
+    networks:
+      - phantom_mesh_net
+
+networks:
+  phantom_mesh_net:
+    driver: bridge
