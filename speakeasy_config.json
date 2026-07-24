@@ -20,7 +20,7 @@
       "broadsheet"
     ],
     "channel_blocklist": [],
-    "max_message_bytes": 1024
+    "max_message_bytes": 200
   },
   "storage": {
     "db_filename": "speakeasy_daemon.db",
@@ -32,3 +32,4 @@
     "log_to_file": true,
     "log_file_path": "~/.reti_speakeasy/logs/daemon.log"
   }
+}

@@ -1,0 +1,5 @@
+# Deliberately narrow: correctness rules (pyflakes + syntax/runtime errors)
+# only, so CI fails on real bugs -- undefined names like the missing RNS import
+# -- without demanding a stylistic rewrite of the existing codebase.
+line-length = 140
+lint.select = ["E4", "E7", "E9", "F"]
