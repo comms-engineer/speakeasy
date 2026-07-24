@@ -11,13 +11,25 @@ from rich.markup import escape
 from textual.app import App, ComposeResult
 from textual.containers import Horizontal, Vertical
 from textual.screen import ModalScreen
-from textual.widgets import Button, DataTable, Footer, Header, Input, Label, ListItem, ListView, RichLog, TabbedContent, TabPane, TextArea
+from textual.widgets import Button, DataTable, Footer, Header, Input, Label, RichLog, TabbedContent, TabPane, TextArea
 
-from fed_engine import Opcode, S2SProtocolEngine
+from fed_engine import MAX_MESSAGE_CONTENT_BYTES, Opcode, S2SProtocolEngine
 from speakeasy_db import BandwidthClass, SpeakeasyDB
 
 APP_NAME = "speakeasy"
 ASPECT_HOST = "host"
+
+STATE_DIR = os.path.expanduser("~/.reti_speakeasy")
+
+
+def instance_name() -> str:
+    return sys.argv[1] if len(sys.argv) > 1 else "client_default"
+
+
+def client_db_path() -> str:
+    """Client state lives alongside the identity file so it is independent of CWD."""
+    os.makedirs(STATE_DIR, exist_ok=True)
+    return os.path.join(STATE_DIR, f"speakeasy_{instance_name()}.db")
 
 # -----------------------------------------------------------------------------
 # Host Discovery & Ranking Manager
@@ -53,7 +65,8 @@ class HostManager:
             "hex_hash": hex_hash,
             "identity": announced_identity,
             "alias": metadata.get("name", f"Host-{hex_hash[:6]}"),
-            "hops": RNS.Transport.hops_to(destination_hash),
+            # hops_to() returns None while no path is known yet.
+            "hops": RNS.Transport.hops_to(destination_hash) or 99,
             "load": metadata.get("load", 0),
             "max_load": metadata.get("max_load", 10),
             "last_seen": time.time(),
@@ -336,15 +349,13 @@ class ReticulumEngine:
         self.current_host_hash = None
         self.auto_failover_enabled = True
 
-        instance_name = sys.argv[1] if len(sys.argv) > 1 else "client_default"
-        self.db = SpeakeasyDB(f"speakeasy_{instance_name}.db")
+        self.db = SpeakeasyDB(client_db_path(), max_message_bytes=MAX_MESSAGE_CONTENT_BYTES)
         self.rns = RNS.Reticulum()
 
-        identity_path = os.path.expanduser(f"~/.reti_speakeasy/{instance_name}_identity")
+        identity_path = os.path.join(STATE_DIR, f"{instance_name()}_identity")
         if os.path.exists(identity_path):
             self.identity = RNS.Identity.from_file(identity_path)
         else:
-            os.makedirs(os.path.dirname(identity_path), exist_ok=True)
             self.identity = RNS.Identity()
             self.identity.to_file(identity_path)
 
@@ -448,7 +459,7 @@ class ReticulumEngine:
 
     def _on_link_closed(self, link):
         self.active_host_link = None
-        self._notify_ui("system", f"[bold red]Disconnected:[/] Host link dropped.")
+        self._notify_ui("system", "[bold red]Disconnected:[/] Host link dropped.")
         self._notify_ui("host_updated", "None")
 
         if self.auto_failover_enabled and self.current_host_hash:
@@ -479,19 +490,19 @@ class ReticulumEngine:
         except Exception as e:
             self._notify_ui("system", f"Failed to process packet: {e}")
 
-# In ReticulumEngine (reti_speakeasy.py), update broadcast_chat_message and broadcast_bulletin:
-
     def broadcast_chat_message(self, channel: str, text: str):
-        # Use the signed insertion method instead of non-existent insert_message
         msg_record = self.db.sign_and_insert_message(self.identity, channel, text)
-        if msg_record:
-            push_frames = self.s2s_engine.build_delta_push_chunks([msg_record])
-            if self.active_host_link and self.active_host_link.status == RNS.Link.ACTIVE:
-                for frame in push_frames:
-                    RNS.Packet(self.active_host_link, frame).send()
+        if not msg_record:
+            self._notify_ui("system", f"[bold red]Not sent:[/] messages are limited to "
+                                      f"{MAX_MESSAGE_CONTENT_BYTES} bytes.")
+            return
+
+        push_frames = self.s2s_engine.build_delta_push_chunks([msg_record])
+        if self.active_host_link and self.active_host_link.status == RNS.Link.ACTIVE:
+            for frame in push_frames:
+                RNS.Packet(self.active_host_link, frame).send()
 
     def broadcast_bulletin(self, title: str, body: str) -> str:
-        # Use sign_and_add_bulletin to ensure the record carries a valid signature
         bulletin_record = self.db.sign_and_add_bulletin(self.identity, title, body)
         if bulletin_record and bulletin_record.get("bulletin_id"):
             bulletin_frame = self.s2s_engine.build_bulletin_post(bulletin_record)
@@ -531,9 +542,9 @@ class RetiSpeakeasyApp(App):
     def compose(self) -> ComposeResult:
         yield Header(show_clock=True)
 
-        instance_name = sys.argv[1] if len(sys.argv) > 1 else "client_default"
-        temp_db = SpeakeasyDB(f"speakeasy_{instance_name}.db")
-        db_chans = temp_db.get_channels()
+        startup_db = SpeakeasyDB(client_db_path())
+        db_chans = startup_db.get_channels()
+        startup_db.close()
 
         with Horizontal():
             with Vertical(id="sidebar"):
@@ -631,12 +642,13 @@ class RetiSpeakeasyApp(App):
         self.push_screen(HostSelectorModal(self.engine.host_manager), handle_host_selection)
 
     def action_show_profile_modal(self) -> None:
-        profile = self.engine.db.get_profile(self.engine.destination.hash.hex())
+        # Profiles are keyed on the identity hash, not the destination hash.
+        profile = self.engine.db.get_profile(self.engine.identity.hash.hex())
 
         def handle_profile(data: dict | None) -> None:
             if data:
                 # Sign and upsert via DB helper to generate proper signature and edited_at timestamp
-                profile_record = self.db.sign_and_upsert_profile(
+                profile_record = self.engine.db.sign_and_upsert_profile(
                     identity=self.engine.identity,
                     handle=data["handle"],
                     status=data["status"],

@@ -8,11 +8,12 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 WORKDIR /app
 
-# Install headless Reticulum dependencies
-RUN pip install --no-cache-dir rns msgpack
+# Install pinned headless Reticulum dependencies
+COPY requirements.txt ./
+RUN pip install --no-cache-dir -r requirements.txt
 
 # Copy core engine source files
-COPY speakeasy_db.py fed_engine.py speakeasy_daemon.py speakeasy_config.json signing.py ./
+COPY speakeasy_db.py fed_engine.py speakeasy_daemon.py speakeasy_config.json signing.py reti_speakeasy.py ./
 
 # Create persistent state directory for identities and SQLite databases
 RUN mkdir -p /root/.reti_speakeasy

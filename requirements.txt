@@ -1,0 +1,4 @@
+rns==1.4.0
+msgpack==1.1.0
+textual==6.4.0
+rich==14.2.0
