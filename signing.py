@@ -16,6 +16,11 @@ def canonical_profile_bytes(identity_hash: str, handle: str, status: str, bio: s
     raw = f"{identity_hash}:{handle}:{status}:{bio}:{ts_ms}"
     return raw.encode("utf-8")
 
+def canonical_channel_bytes(name: str, description: str, approver_hash: str, created_at: float) -> bytes:
+    ts_ms = int(float(created_at) * 1000)
+    raw = f"{name}:{description}:{approver_hash}:{ts_ms}"
+    return raw.encode("utf-8")
+
 def identity_from_public_key(public_key_bytes) -> RNS.Identity:
     """
     Reconstructs a verify-only RNS.Identity from raw public key bytes.

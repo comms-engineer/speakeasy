@@ -8,11 +8,15 @@ import msgpack
 import RNS
 
 from fed_engine import MAX_MESSAGE_CONTENT_BYTES, Opcode, S2SProtocolEngine
+from operator_iface import OperatorInterface
 from speakeasy_db import BandwidthClass, SpeakeasyDB, DEFAULT_EPOCH_BUCKET_SEC
 
 APP_NAME = "speakeasy"
 ASPECT_HOST = "host"
-ASPECT_CHAT = "parlor"
+
+# Identities pushed to a newly connected peer so it can verify history it is
+# about to receive without a round trip per author.
+IDENTITY_BOOTSTRAP_LIMIT = 100
 
 STATE_DIR = os.path.expanduser("~/.reti_speakeasy")
 
@@ -39,6 +43,22 @@ def configure_logging(log_cfg: dict):
     )
 
 
+class HubAnnounceHandler:
+    """
+    Receives Reticulum announces for the Speakeasy host aspect.
+
+    Discovery is what makes the network self-assembling: without it a hub only
+    ever talks to the peers hard-coded in `static_peers`.
+    """
+
+    def __init__(self, daemon: "SpeakeasyDaemon"):
+        self.aspect_filter = f"{APP_NAME}.{ASPECT_HOST}"
+        self.daemon = daemon
+
+    def received_announce(self, destination_hash, announced_identity, app_data):
+        self.daemon.on_peer_announce(destination_hash, announced_identity, app_data)
+
+
 class SpeakeasyDaemon:
     def __init__(self, config_path: str):
         self.config_path = config_path
@@ -47,6 +67,11 @@ class SpeakeasyDaemon:
 
         self.active_links = []
         self.running = True
+        self.discovered_peers = {}
+        self.operator = None
+        self.announce_handler = None
+        self.propagated_channels = set()
+        self.channels_seeded = False
 
         node_cfg = self.config.get("node", {})
         fed_cfg = self.config.get("federation", {})
@@ -64,6 +89,11 @@ class SpeakeasyDaemon:
         self.channel_blocklist = set(chan_cfg.get("channel_blocklist") or ())
         self.message_ttl_days = storage_cfg.get("message_ttl_days", 0)
         self.vacuum_interval = storage_cfg.get("vacuum_interval_hours", 24) * 3600
+
+        mod_cfg = self.config.get("moderation", {})
+        self.operator_lxmf_hash = mod_cfg.get("operator_lxmf_hash") or ""
+        self.accept_channel_requests = bool(mod_cfg.get("accept_channel_requests", True))
+        self.auto_discover_peers = bool(fed_cfg.get("auto_discover_peers", True))
 
         # 1. Initialize DB & Reticulum Stack
         os.makedirs(STATE_DIR, exist_ok=True)
@@ -111,7 +141,31 @@ class SpeakeasyDaemon:
             bandwidth_class=self.bandwidth_class,
             allowed_channels=self.allowed_channels or None,
             channel_blocklist=self.channel_blocklist,
+            accept_channel_requests=self.accept_channel_requests,
         )
+
+        # 5. Peer discovery & operator control
+        if self.auto_discover_peers:
+            self.announce_handler = HubAnnounceHandler(self)
+            RNS.Transport.register_announce_handler(self.announce_handler)
+            logger.info("Announce-based peer discovery enabled.")
+        else:
+            self.announce_handler = None
+
+        if self.operator_lxmf_hash:
+            try:
+                self.operator = OperatorInterface(
+                    identity=self.identity,
+                    storage_path=os.path.join(STATE_DIR, "lxmf"),
+                    operator_hash=self.operator_lxmf_hash,
+                    command_handler=self.handle_operator_command,
+                    node_name=self.node_name,
+                )
+            except Exception as e:
+                logger.error(f"Could not start the operator LXMF interface: {e}")
+        else:
+            logger.info("No moderation.operator_lxmf_hash configured; "
+                        "use speakeasy_admin.py to review channel requests.")
 
         self.announce_host()
 
@@ -173,10 +227,50 @@ class SpeakeasyDaemon:
 
         hello_frame = self.s2s_engine.build_hello(self.db.get_channel_names())
         RNS.Packet(link, hello_frame).send()
+        self._bootstrap_link(link)
+
+    def _bootstrap_link(self, link):
+        """
+        Hands a fresh peer the keys, profiles and approved channels it needs to
+        make sense of anything this hub relays to it. A client that has never
+        met the other participants cannot verify their signatures, so without
+        this every relayed message is silently discarded on arrival.
+        """
+        identity_hashes = self.db.get_recent_identity_hashes(IDENTITY_BOOTSTRAP_LIMIT)
+        frames = self.s2s_engine.build_identity_frames(identity_hashes)
+        frames += self.s2s_engine.build_profile_frames(identity_hashes)
+        frames += self.s2s_engine.build_channel_frames(
+            [c["name"] for c in self.db.get_signed_channels()]
+        )
+        if self._send_frames(link, frames) and frames:
+            logger.info(f"Bootstrapped peer link with {len(frames)} identity/profile/channel frame(s).")
+
+    def _send_frames(self, link, frames) -> bool:
+        if link.status != RNS.Link.ACTIVE:
+            return False
+        for frame in frames:
+            RNS.Packet(link, frame).send()
+        return True
+
+    def _broadcast(self, frames, exclude_link=None) -> int:
+        if not frames:
+            return 0
+        peers = [
+            link for link in self.active_links
+            if link is not exclude_link and link.status == RNS.Link.ACTIVE
+        ]
+        for link in peers:
+            self._send_frames(link, frames)
+        return len(peers)
 
     def _on_remote_identified(self, link, remote_identity):
         if remote_identity:
             self._register_remote_identity(remote_identity)
+            # Everyone else needs this key to verify what this peer posts.
+            self._broadcast(
+                self.s2s_engine.build_identity_frames([remote_identity.hash.hex()]),
+                exclude_link=link
+            )
 
     def _register_remote_identity(self, remote_identity):
         remote_hash_hex = remote_identity.hash.hex()
@@ -196,32 +290,181 @@ class SpeakeasyDaemon:
 
     def _on_packet_received(self, message, packet):
         try:
-            accepted_msg_ids = []
-            opcode, response_frames = self.s2s_engine.process_inbound_frame(message, accepted_msg_ids)
+            result = self.s2s_engine.process_inbound_frame(message)
 
-            # Send direct responses back to sender
-            for resp_bytes in response_frames:
-                RNS.Packet(packet.link, resp_bytes).send()
+            # Direct responses go back to the sender.
+            self._send_frames(packet.link, result.frames)
 
-            # HUB RELAY: fan out real-time messages that verified locally. The
-            # inbound frame itself is never forwarded -- a single frame can mix
-            # valid records with forged ones, and relaying raw bytes would turn
-            # the hub into an amplifier for unsigned traffic.
-            if opcode == Opcode.DELTA_PUSH and accepted_msg_ids:
-                relay_frames = self.s2s_engine.build_relay_frames(accepted_msg_ids, hop_count=1)
-                peers = [
-                    link for link in self.active_links
-                    if link != packet.link and link.status == RNS.Link.ACTIVE
+            # HUB RELAY: fan out records that verified locally. The inbound
+            # frame itself is never forwarded -- a single frame can mix valid
+            # records with forged ones, and relaying raw bytes would turn the
+            # hub into an amplifier for unsigned traffic.
+            relay_frames = []
+            if result.opcode == Opcode.DELTA_PUSH and result.accepted_msg_ids:
+                senders = [
+                    row["sender_hash"] for row in
+                    (self.db.get_message(m) for m in result.accepted_msg_ids) if row
                 ]
-                for link in peers:
-                    for frame in relay_frames:
-                        RNS.Packet(link, frame).send()
-                if peers:
-                    logger.info(f"Relayed {len(accepted_msg_ids)} verified message(s) "
-                                f"to {len(peers)} peer link(s).")
+                # Keys first: a peer meeting this author for the first time
+                # cannot verify the message that follows without them.
+                relay_frames += self.s2s_engine.build_identity_frames(senders)
+                relay_frames += self.s2s_engine.build_relay_frames(result.accepted_msg_ids, hop_count=1)
+
+            if result.accepted_profiles:
+                relay_frames += self.s2s_engine.build_identity_frames(result.accepted_profiles)
+                relay_frames += self.s2s_engine.build_profile_frames(result.accepted_profiles)
+
+            if result.accepted_channels:
+                relay_frames += self.s2s_engine.build_channel_frames(result.accepted_channels, hop_count=1)
+
+            peer_count = self._broadcast(relay_frames, exclude_link=packet.link)
+            if peer_count and relay_frames:
+                logger.info(f"Relayed {len(relay_frames)} verified frame(s) to {peer_count} peer link(s).")
+
+            for request in result.channel_requests:
+                self._notify_operator_of_request(request)
 
         except Exception as e:
             logger.error(f"Error processing inbound frame: {e}", exc_info=True)
+
+    # ------------------------------------------------------------------
+    # Channel requests & operator control
+    # ------------------------------------------------------------------
+
+    def _notify_operator_of_request(self, request: dict):
+        profile = self.db.find_profile(request["requester_hash"]) or {}
+        requester = profile.get("handle") or request["requester_hash"][:10]
+        if self.operator and self.operator.notify_channel_request(
+            request["name"], request["description"], str(requester)
+        ):
+            logger.info(f"Notified operator of channel request #{request['name']}")
+        else:
+            logger.info(f"Channel request #{request['name']} is pending operator review "
+                        f"(no operator notification delivered).")
+
+    def approve_channel(self, name: str) -> str:
+        pending = {r["name"]: r for r in self.db.get_channel_requests("pending")}
+        description = (pending.get(name) or {}).get("description") or f"Channel #{name}"
+
+        record = self.db.sign_and_add_channel(self.identity, name, description)
+        if not record:
+            return f"Could not approve #{name}."
+
+        self.db.set_channel_request_status(name, "approved")
+        self.allowed_channels.add(name)
+        self.s2s_engine.allowed_channels = self.allowed_channels or None
+
+        peers = self._broadcast(self.s2s_engine.build_channel_frames([name]))
+        logger.info(f"Approved channel #{name}; propagated to {peers} peer link(s).")
+        return f"Approved #{name} and propagated it to {peers} connected peer(s)."
+
+    def deny_channel(self, name: str) -> str:
+        if self.db.set_channel_request_status(name, "denied"):
+            logger.info(f"Denied channel request #{name}.")
+            return f"Denied #{name}."
+        return f"No pending request for #{name}."
+
+    def handle_operator_command(self, command: str, argument: str) -> str:
+        if command == "approve" and argument:
+            return self.approve_channel(argument.lstrip("#"))
+        if command == "deny" and argument:
+            return self.deny_channel(argument.lstrip("#"))
+        if command == "pending":
+            requests = self.db.get_channel_requests("pending")
+            if not requests:
+                return "No pending channel requests."
+            return "Pending:\n" + "\n".join(
+                f"#{r['name']} - {r['description'] or '(no description)'}" for r in requests
+            )
+        if command == "channels":
+            return "Channels: " + ", ".join(f"#{c}" for c in self.db.get_channel_names())
+        return ""
+
+    # ------------------------------------------------------------------
+    # Peer discovery
+    # ------------------------------------------------------------------
+
+    def on_peer_announce(self, destination_hash, announced_identity, app_data):
+        """Queues a discovered hub for connection on the service loop thread."""
+        if not announced_identity or announced_identity.hash == self.identity.hash:
+            return
+
+        peer_hex = destination_hash.hex()
+        if peer_hex in self.discovered_peers:
+            return
+
+        name = peer_hex[:10]
+        if app_data:
+            try:
+                name = str(msgpack.unpackb(app_data, raw=False).get("name", name))
+            except Exception:
+                pass
+
+        self.discovered_peers[peer_hex] = announced_identity
+        self.db.upsert_identity(
+            identity_hash=announced_identity.hash.hex(),
+            alias=name,
+            public_key=announced_identity.get_public_key(),
+        )
+        logger.info(f"Discovered Speakeasy hub '{name}' at [{peer_hex[:10]}]")
+
+    def _is_connected_to(self, identity) -> bool:
+        for link in self.active_links:
+            remote = link.get_remote_identity()
+            if remote and remote.hash == identity.hash and link.status != RNS.Link.CLOSED:
+                return True
+        return False
+
+    def propagate_new_channels(self):
+        """
+        Gossips approved channels this daemon has not announced yet.
+
+        Approvals can also arrive out-of-band (speakeasy_admin.py writing to the
+        same database), so the channel table -- not the approval call path -- is
+        what drives propagation.
+        """
+        names = [c["name"] for c in self.db.get_signed_channels()]
+        if not self.channels_seeded:
+            # Whatever was already approved before startup has had its chance to
+            # federate; only re-announce it when a peer links.
+            self.propagated_channels.update(names)
+            self.channels_seeded = True
+            return
+
+        fresh = [name for name in names if name not in self.propagated_channels]
+        if not fresh:
+            return
+
+        self.propagated_channels.update(fresh)
+        self.allowed_channels.update(fresh)
+        self.s2s_engine.allowed_channels = self.allowed_channels or None
+        peers = self._broadcast(self.s2s_engine.build_channel_frames(fresh))
+        logger.info(f"Propagated {len(fresh)} approved channel(s) to {peers} peer link(s).")
+
+    def connect_discovered_peers(self):
+        """Links to hubs learned from announces, respecting local capacity."""
+        if not self.auto_discover_peers:
+            return
+
+        for peer_hex, identity in list(self.discovered_peers.items()):
+            if len(self.active_links) >= self.max_clients:
+                logger.info("At link capacity; deferring discovered peer connections.")
+                return
+            if self._is_connected_to(identity):
+                continue
+            try:
+                self._link_to(identity, peer_hex)
+            except Exception as e:
+                logger.error(f"Failed to link discovered peer [{peer_hex[:10]}]: {e}")
+
+    def _link_to(self, identity, label: str):
+        logger.info(f"Initiating link to hub [{label[:10]}]...")
+        # Interface settlement delay.
+        time.sleep(self.settlement_delay)
+        target = RNS.Destination(identity, RNS.Destination.OUT, RNS.Destination.SINGLE, APP_NAME, ASPECT_HOST)
+        link = RNS.Link(target)
+        link.set_link_established_callback(self._on_outbound_link)
+        link.set_link_closed_callback(self._on_link_closed)
 
     def maintain_static_peers(self):
         """Attempts connection to configured static peer host nodes."""
@@ -242,15 +485,7 @@ class SpeakeasyDaemon:
                         for link in self.active_links if link.status == RNS.Link.ACTIVE
                     )
                     if not already_connected:
-                        logger.info(f"Initiating link to static peer host [{clean_hex[:10]}]...")
-
-                        # Interface Settlement Delay
-                        time.sleep(self.settlement_delay)
-
-                        target_dest = RNS.Destination(identity, RNS.Destination.OUT, RNS.Destination.SINGLE, APP_NAME, ASPECT_HOST)
-                        link = RNS.Link(target_dest)
-                        link.set_link_established_callback(self._on_outbound_link)
-                        link.set_link_closed_callback(self._on_link_closed)
+                        self._link_to(identity, clean_hex)
             except Exception as e:
                 logger.error(f"Failed static peer connection to [{clean_hex[:10]}]: {e}")
 
@@ -263,6 +498,8 @@ class SpeakeasyDaemon:
             now = time.time()
             if now - last_sync >= self.sync_interval:
                 self.maintain_static_peers()
+                self.connect_discovered_peers()
+                self.propagate_new_channels()
                 last_sync = now
 
             if now - last_announce >= self.announce_interval:
@@ -279,6 +516,10 @@ class SpeakeasyDaemon:
     def stop(self):
         logger.info("Shutting down daemon...")
         self.running = False
+        if self.announce_handler:
+            RNS.Transport.deregister_announce_handler(self.announce_handler)
+        if self.operator:
+            self.operator.stop()
         for link in list(self.active_links):
             try:
                 link.teardown()

@@ -15,12 +15,16 @@
   },
   "channels": {
     "allowed_channels": [
+      "general",
       "parlor",
-      "backroom",
-      "broadsheet"
+      "tech"
     ],
     "channel_blocklist": [],
     "max_message_bytes": 200
+  },
+  "moderation": {
+    "accept_channel_requests": true,
+    "operator_lxmf_hash": ""
   },
   "storage": {
     "db_filename": "speakeasy_daemon.db",

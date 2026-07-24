@@ -13,7 +13,8 @@ COPY requirements.txt ./
 RUN pip install --no-cache-dir -r requirements.txt
 
 # Copy core engine source files
-COPY speakeasy_db.py fed_engine.py speakeasy_daemon.py speakeasy_config.json signing.py reti_speakeasy.py ./
+COPY speakeasy_db.py fed_engine.py speakeasy_daemon.py speakeasy_config.json signing.py \
+     reti_speakeasy.py operator_iface.py speakeasy_admin.py ./
 
 # Create persistent state directory for identities and SQLite databases
 RUN mkdir -p /root/.reti_speakeasy

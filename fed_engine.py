@@ -1,7 +1,8 @@
 import enum
 import logging
 from collections import OrderedDict
-from typing import Optional, Set
+from dataclasses import dataclass, field
+from typing import Any, Dict, List, Optional, Set
 import msgpack
 import signing
 from speakeasy_db import BandwidthClass, SpeakeasyDB
@@ -25,6 +26,12 @@ MAX_HOP_COUNT = 8
 # oldest-first is safe.
 SEEN_CACHE_LIMIT = 8192
 
+# Records whose author is unknown are parked here while an IDENTITY_REQ is in
+# flight, then re-verified once the key arrives. Without this, a record that
+# overtakes its author's key is lost permanently -- the sender has no reason to
+# ever send it again.
+DEFERRED_RECORD_LIMIT = 512
+
 
 class Opcode(enum.IntEnum):
     FED_HELLO = 0x01
@@ -35,6 +42,29 @@ class Opcode(enum.IntEnum):
     CHANNEL_ADD = 0x06
     PROFILE_SYNC = 0x07
     BULLETIN_POST = 0x08
+    IDENTITY_PUSH = 0x09
+    IDENTITY_REQ = 0x0A
+    CHANNEL_REQ = 0x0B
+
+
+@dataclass
+class FrameResult:
+    """
+    Outcome of one inbound frame.
+
+    The caller needs more than the opcode to decide what to gossip: only
+    records that actually verified locally may be re-broadcast, and the hub
+    must be able to forward the *keys* behind them, otherwise a peer that has
+    never met the author cannot verify anything it is sent.
+    """
+    opcode: Optional[Opcode]
+    frames: List[bytes] = field(default_factory=list)
+    accepted_msg_ids: List[str] = field(default_factory=list)
+    accepted_profiles: List[str] = field(default_factory=list)
+    accepted_channels: List[str] = field(default_factory=list)
+    learned_identities: List[str] = field(default_factory=list)
+    channel_requests: List[Dict[str, Any]] = field(default_factory=list)
+    hello_channels: List[str] = field(default_factory=list)
 
 
 class WireCodec:
@@ -63,18 +93,21 @@ class S2SProtocolEngine:
     `origin_hash` before anything gets stored or re-relayed. This engine does
     not itself decide what to trust -- it unpacks wire frames and hands raw,
     still-unverified data to the DB layer, which is the actual choke point.
+    Channel and hop policy are the exception: those are properties of the link
+    rather than of a signed record, so they are enforced here.
     """
 
     def __init__(self, db: SpeakeasyDB, local_hash_bytes: bytes, bandwidth_class: BandwidthClass,
-                 allowed_channels: Optional[Set[str]] = None, channel_blocklist: Optional[Set[str]] = None):
+                 allowed_channels: Optional[Set[str]] = None, channel_blocklist: Optional[Set[str]] = None,
+                 accept_channel_requests: bool = False):
         self.db = db
         self.local_hash_bytes = local_hash_bytes
         self.bandwidth_class = bandwidth_class
-        # CHANNEL_ADD is currently unsigned, so policy is the only thing
-        # standing between a peer and arbitrary channel creation.
         self.allowed_channels = set(allowed_channels) if allowed_channels else None
         self.channel_blocklist = set(channel_blocklist or ())
+        self.accept_channel_requests = accept_channel_requests
         self.seen_msg_ids: OrderedDict = OrderedDict()
+        self.deferred_messages: OrderedDict = OrderedDict()
 
     def _mark_seen(self, msg_id: str):
         self.seen_msg_ids[msg_id] = None
@@ -84,7 +117,22 @@ class S2SProtocolEngine:
     def channel_permitted(self, channel: str) -> bool:
         if channel in self.channel_blocklist:
             return False
-        return self.allowed_channels is None or channel in self.allowed_channels
+        if self.allowed_channels is None or channel in self.allowed_channels:
+            return True
+        # A channel an operator approved and federated is as valid as one named
+        # in the local config; otherwise newly approved channels could never
+        # carry traffic on peer hubs.
+        record = self.db.get_channel(channel)
+        return bool(record and record.get("signature"))
+
+    def _defer_message(self, sender_hash: str, msg_tuple: list):
+        pending = self.deferred_messages.setdefault(sender_hash, [])
+        pending.append(msg_tuple)
+        self.deferred_messages.move_to_end(sender_hash)
+        total = sum(len(v) for v in self.deferred_messages.values())
+        while total > DEFERRED_RECORD_LIMIT and self.deferred_messages:
+            _, dropped = self.deferred_messages.popitem(last=False)
+            total -= len(dropped)
 
     def build_relay_frames(self, msg_ids: list, hop_count: int = 0) -> list:
         """
@@ -99,6 +147,39 @@ class S2SProtocolEngine:
                 rows.append(row)
         return self.build_delta_push_chunks(rows, hop_count=hop_count) if rows else []
 
+    def build_identity_push(self, identity_hash_hex: str) -> Optional[bytes]:
+        """
+        Frame carrying an identity's public key.
+
+        No signature is needed: the key is self-authenticating, because the
+        receiver only accepts it if it hashes to the claimed identity hash.
+        """
+        record = self.db.get_identity_record(identity_hash_hex)
+        public_key = record.get("public_key") if record else None
+        if not public_key:
+            public_key = self.db.get_public_key(identity_hash_hex)
+        if not public_key:
+            return None
+        alias = (record or {}).get("alias") or ""
+        payload = {0: bytes.fromhex(identity_hash_hex), 1: bytes(public_key), 2: alias}
+        return WireCodec.pack(Opcode.IDENTITY_PUSH, self.local_hash_bytes, payload)
+
+    def build_identity_frames(self, identity_hashes) -> list:
+        frames = []
+        for identity_hash in dict.fromkeys(identity_hashes):
+            frame = self.build_identity_push(identity_hash)
+            if frame:
+                frames.append(frame)
+        return frames
+
+    def build_identity_req(self, identity_hashes) -> bytes:
+        wanted = [bytes.fromhex(h) for h in dict.fromkeys(identity_hashes)]
+        return WireCodec.pack(Opcode.IDENTITY_REQ, self.local_hash_bytes, {0: wanted})
+
+    def build_channel_req(self, channel_name: str, description: str) -> bytes:
+        payload = {0: channel_name, 1: description}
+        return WireCodec.pack(Opcode.CHANNEL_REQ, self.local_hash_bytes, payload)
+
     def build_hello(self, active_channels: list[str]) -> bytes:
         payload = {
             0: 1,
@@ -108,11 +189,47 @@ class S2SProtocolEngine:
         }
         return WireCodec.pack(Opcode.FED_HELLO, self.local_hash_bytes, payload)
 
-    def build_channel_add(self, channel_name: str, description: str) -> bytes:
-        payload = {0: channel_name, 1: description}
-        return WireCodec.pack(Opcode.CHANNEL_ADD, self.local_hash_bytes, payload)
+    def build_channel_add(self, record: dict, hop_count: int = 0) -> bytes:
+        """
+        `record` is an operator-approved channel row (from
+        SpeakeasyDB.sign_and_add_channel, or a stored channel), carrying the
+        approving hub's signature so any hub down the line verifies the
+        approval itself instead of trusting whoever relayed it.
+        """
+        approver_hash = record["approver_hash"]
+        payload = {
+            0: record["name"],
+            1: record.get("description") or "",
+            2: bytes.fromhex(approver_hash),
+            3: float(record["created_at"]),
+            4: record["signature"],
+            5: self.db.get_public_key(approver_hash) or b"",
+        }
+        return WireCodec.pack(Opcode.CHANNEL_ADD, self.local_hash_bytes, payload, hop_count)
 
-    def build_profile_sync(self, record: dict) -> bytes:
+    def build_channel_frames(self, channel_names, hop_count: int = 0) -> list:
+        """Re-packs locally stored, operator-approved channels for propagation."""
+        frames = []
+        for name in dict.fromkeys(channel_names):
+            record = self.db.get_channel(name)
+            if record and record.get("signature") and record.get("approver_hash"):
+                frames.append(self.build_channel_add(record, hop_count=hop_count))
+        return frames
+
+    def build_profile_frames(self, identity_hashes) -> list:
+        """Re-packs locally stored (therefore verified) profiles for gossip."""
+        frames = []
+        for identity_hash in dict.fromkeys(identity_hashes):
+            record = self.db.find_profile(identity_hash)
+            if not record or not record.get("signature"):
+                continue
+            record = dict(record)
+            if not record.get("public_key"):
+                record["public_key"] = self.db.get_public_key(identity_hash)
+            frames.append(self.build_profile_sync(record, origin_hash_hex=identity_hash))
+        return frames
+
+    def build_profile_sync(self, record: dict, origin_hash_hex: Optional[str] = None) -> bytes:
         payload = {
             0: record.get("handle", ""),
             1: record.get("status", ""),
@@ -121,7 +238,11 @@ class S2SProtocolEngine:
             4: record["signature"],
             5: record.get("public_key") or b"",
         }
-        return WireCodec.pack(Opcode.PROFILE_SYNC, self.local_hash_bytes, payload)
+        # A relayed profile keeps the *author's* hash as origin, not the
+        # relaying hub's, otherwise the signature is checked against the wrong
+        # identity downstream and every gossiped profile is discarded.
+        origin = bytes.fromhex(origin_hash_hex) if origin_hash_hex else self.local_hash_bytes
+        return WireCodec.pack(Opcode.PROFILE_SYNC, origin, payload)
 
     def build_bulletin_post(self, record: dict) -> bytes:
         """
@@ -206,22 +327,22 @@ class S2SProtocolEngine:
             frames.append(WireCodec.pack(Opcode.DELTA_PUSH, self.local_hash_bytes, {0: current_batch}, hop_count))
         return frames
 
-    def process_inbound_frame(self, raw_bytes: bytes, accepted_msg_ids: Optional[list] = None) -> tuple[Opcode, list[bytes]]:
+    def process_inbound_frame(self, raw_bytes: bytes) -> FrameResult:
         """
-        Unpacks and applies one frame.
+        Unpacks and applies one frame, reporting what was accepted.
 
-        :param accepted_msg_ids: If supplied, ids of messages that verified and
-            were stored are appended to it, so the caller can relay exactly
-            those records. RNS delivers packets on multiple threads, so this is
-            a per-call output list rather than engine state.
+        RNS delivers packets on its own threads, so everything the caller needs
+        in order to gossip the result comes back in the FrameResult rather than
+        accumulating in engine state.
         """
         try:
             opcode, origin_hash, hop_count, payload = WireCodec.unpack(raw_bytes)
         except Exception as e:
             logger.error(f"Malformed frame: {e}")
-            return None, []
+            return FrameResult(opcode=None)
 
-        outbound_frames = []
+        result = FrameResult(opcode=opcode)
+        outbound_frames = result.frames
 
         if opcode == Opcode.FED_HELLO:
             raw_channels = payload.get(2, [])
@@ -240,8 +361,9 @@ class S2SProtocolEngine:
                     f"Peer {origin_hash.hex()[:10]} uses epoch_bucket_sec={remote_bucket} but this node "
                     f"uses {self.db.epoch_bucket_sec}; epoch roots can never agree. Skipping sync."
                 )
-                return opcode, outbound_frames
+                return result
 
+            result.hello_channels = channels
             current_epoch = self.db.current_epoch()
             local_chan_names = set(self.db.get_channel_names())
 
@@ -251,14 +373,52 @@ class S2SProtocolEngine:
 
         elif opcode == Opcode.CHANNEL_ADD:
             chan_name = payload[0]
-            desc = payload[1]
+            desc = payload[1] or ""
             if isinstance(chan_name, dict):
                 chan_name = chan_name.get("name", "unknown")
-            if not self.channel_permitted(str(chan_name)):
+            chan_name = str(chan_name)
+            approver_hash = payload[2].hex() if isinstance(payload.get(2), bytes) else str(payload.get(2) or "")
+            created_at = payload.get(3) or 0.0
+            signature = payload.get(4) or b""
+            approver_key = payload.get(5) or None
+
+            if approver_key:
+                self._learn_identity(payload[2], approver_key, alias="", result=result)
+
+            if chan_name in self.channel_blocklist:
                 logger.warning(f"Refused CHANNEL_ADD for #{chan_name} from {origin_hash.hex()[:10]}: "
-                               f"channel not permitted by local policy")
-            elif self.db.add_channel(str(chan_name), str(desc)):
-                logger.info(f"Replicated new federated channel: #{chan_name}")
+                               f"channel is blocklisted")
+            elif self.db.verify_and_add_channel(name=chan_name, description=str(desc),
+                                                approver_hash=approver_hash, created_at=created_at,
+                                                signature=signature, public_key=approver_key):
+                logger.info(f"Replicated federated channel #{chan_name} "
+                            f"(approved by {approver_hash[:10]})")
+                result.accepted_channels.append(chan_name)
+
+        elif opcode == Opcode.CHANNEL_REQ:
+            chan_name = str(payload[0])
+            desc = str(payload[1] or "")
+            if not self.accept_channel_requests:
+                logger.info(f"Ignored channel request for #{chan_name}: this node does not take requests")
+            elif chan_name in self.channel_blocklist:
+                logger.info(f"Ignored channel request for #{chan_name}: blocklisted")
+            elif self.db.add_channel_request(chan_name, desc, origin_hash.hex()):
+                logger.info(f"Queued channel request for #{chan_name} from {origin_hash.hex()[:10]}")
+                result.channel_requests.append({
+                    "name": chan_name,
+                    "description": desc,
+                    "requester_hash": origin_hash.hex(),
+                })
+
+        elif opcode == Opcode.IDENTITY_PUSH:
+            self._learn_identity(payload[0], payload[1], alias=str(payload.get(2) or ""), result=result)
+            self._retry_deferred(payload[0].hex(), result)
+
+        elif opcode == Opcode.IDENTITY_REQ:
+            for wanted in payload[0]:
+                frame = self.build_identity_push(wanted.hex())
+                if frame:
+                    outbound_frames.append(frame)
 
         elif opcode == Opcode.PROFILE_SYNC:
             handle, status, bio = payload[0], payload[1], payload[2]
@@ -267,24 +427,16 @@ class S2SProtocolEngine:
             pub_key = payload.get(5) if len(payload) > 5 else None
 
             if pub_key:
-                reconstructed = signing.identity_from_public_key(pub_key)
-                if reconstructed is None:
-                    logger.warning(f"PROFILE_SYNC from {origin_hash.hex()[:10]} carried an unusable public key")
-                elif reconstructed.hash != origin_hash:
-                    logger.warning(f"PROFILE_SYNC from {origin_hash.hex()[:10]} carried a public key "
-                                   f"belonging to {reconstructed.hash.hex()[:10]}; not stored")
-                else:
-                    self.db.upsert_identity(
-                        identity_hash=origin_hash.hex(),
-                        alias=str(handle),
-                        public_key=pub_key
-                    )
+                self._learn_identity(origin_hash, pub_key, alias=str(handle), result=result)
 
             ok = self.db.verify_and_upsert_profile(
                 identity_hash=origin_hash.hex(), handle=handle, status=status, bio=bio,
                 edited_at=edited_at, signature=signature
             )
-            if not ok:
+            if ok:
+                result.accepted_profiles.append(origin_hash.hex())
+                self._retry_deferred(origin_hash.hex(), result)
+            else:
                 logger.info(f"Discarded profile sync from {origin_hash.hex()[:10]} (failed verification or stale edit)")
 
         elif opcode == Opcode.BULLETIN_POST:
@@ -333,37 +485,78 @@ class S2SProtocolEngine:
             if hop_count > MAX_HOP_COUNT:
                 logger.info(f"Dropped DELTA_PUSH from {origin_hash.hex()[:10]}: hop count {hop_count} "
                             f"exceeds MAX_HOP_COUNT ({MAX_HOP_COUNT})")
-                return opcode, outbound_frames
+                return result
 
+            unknown_senders = []
             for msg_tuple in payload[0]:
-                msg_id_hex, channel, sender_hash_hex, ts, content = (
-                    msg_tuple[0].hex(), msg_tuple[1], msg_tuple[2].hex(), msg_tuple[3], msg_tuple[4]
-                )
-                signature = msg_tuple[5] if len(msg_tuple) > 5 else b""
-                if isinstance(channel, dict):
-                    channel = channel.get("name", "")
+                sender_hash_hex = msg_tuple[2].hex()
+                if not self._apply_message(msg_tuple, result) and not self.db.get_public_key(sender_hash_hex):
+                    unknown_senders.append(sender_hash_hex)
 
-                if msg_id_hex in self.seen_msg_ids:
-                    continue
+            if unknown_senders:
+                # The record arrived before its author's key. Park it and ask;
+                # dropping it outright loses the message for good, since the
+                # sender has no reason to ever transmit it again.
+                outbound_frames.append(self.build_identity_req(unknown_senders))
 
-                if not self.channel_permitted(str(channel)):
-                    logger.info(f"Discarded message {msg_id_hex[:10]}: channel #{channel} not permitted")
-                    continue
+        return result
 
-                # Only accepted ids are cached. Marking seen before verifying
-                # would let anyone who has observed a public msg_id pre-send a
-                # frame with that id and a bogus signature, permanently
-                # suppressing the legitimate record.
-                ok = self.db.verify_and_add_message(
-                    msg_id=msg_id_hex, channel=str(channel), sender_hash=sender_hash_hex,
-                    content=content, timestamp=ts, signature=signature
-                )
-                if ok:
-                    self._mark_seen(msg_id_hex)
-                    if accepted_msg_ids is not None:
-                        accepted_msg_ids.append(msg_id_hex)
-                else:
-                    logger.info(f"Discarded message {msg_id_hex[:10]} in #{channel} "
-                                f"from {sender_hash_hex[:10]} (failed verification)")
+    def _learn_identity(self, identity_hash_bytes: bytes, public_key: bytes, alias: str,
+                        result: FrameResult) -> bool:
+        """Stores a public key only if it hashes to the identity claiming it."""
+        reconstructed = signing.identity_from_public_key(public_key)
+        identity_hash_hex = identity_hash_bytes.hex()
 
-        return opcode, outbound_frames
+        if reconstructed is None:
+            logger.warning(f"Ignored unusable public key offered for {identity_hash_hex[:10]}")
+            return False
+        if reconstructed.hash != identity_hash_bytes:
+            logger.warning(f"Ignored public key offered for {identity_hash_hex[:10]}: it belongs to "
+                           f"{reconstructed.hash.hex()[:10]}")
+            return False
+
+        known = self.db.get_public_key(identity_hash_hex)
+        self.db.upsert_identity(identity_hash=identity_hash_hex, alias=alias, public_key=public_key)
+        if not known:
+            logger.info(f"Learned public key for {identity_hash_hex[:10]}")
+            result.learned_identities.append(identity_hash_hex)
+        return True
+
+    def _apply_message(self, msg_tuple, result: FrameResult) -> bool:
+        msg_id_hex, channel, sender_hash_hex, ts, content = (
+            msg_tuple[0].hex(), msg_tuple[1], msg_tuple[2].hex(), msg_tuple[3], msg_tuple[4]
+        )
+        signature = msg_tuple[5] if len(msg_tuple) > 5 else b""
+        if isinstance(channel, dict):
+            channel = channel.get("name", "")
+
+        if msg_id_hex in self.seen_msg_ids or self.db.has_message(msg_id_hex):
+            return True
+
+        if not self.channel_permitted(str(channel)):
+            logger.info(f"Discarded message {msg_id_hex[:10]}: channel #{channel} not permitted")
+            return False
+
+        # Only accepted ids are cached. Marking seen before verifying would let
+        # anyone who has observed a public msg_id pre-send a frame with that id
+        # and a bogus signature, permanently suppressing the legitimate record.
+        ok = self.db.verify_and_add_message(
+            msg_id=msg_id_hex, channel=str(channel), sender_hash=sender_hash_hex,
+            content=content, timestamp=ts, signature=signature
+        )
+        if ok:
+            self._mark_seen(msg_id_hex)
+            result.accepted_msg_ids.append(msg_id_hex)
+            return True
+
+        if not self.db.get_public_key(sender_hash_hex):
+            self._defer_message(sender_hash_hex, msg_tuple)
+        else:
+            logger.info(f"Discarded message {msg_id_hex[:10]} in #{channel} "
+                        f"from {sender_hash_hex[:10]} (failed verification)")
+        return False
+
+    def _retry_deferred(self, sender_hash_hex: str, result: FrameResult):
+        """Re-verifies records parked while `sender_hash_hex` was unknown."""
+        for msg_tuple in self.deferred_messages.pop(sender_hash_hex, []):
+            self._apply_message(msg_tuple, result)
