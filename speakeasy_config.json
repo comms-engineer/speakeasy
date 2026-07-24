@@ -1,0 +1,34 @@
+{
+  "node": {
+    "name": "Speakeasy-Alpha",
+    "bandwidth_class": "HIGH_SPEED",
+    "sync_interval_sec": 60,
+    "announce_interval_sec": 900,
+    "max_clients": 15
+  },
+  "static_peers": [],
+  "federation": {
+    "auto_discover_peers": true,
+    "epoch_bucket_sec": 300,
+    "max_sync_history_days": 14,
+    "settlement_delay_ms": 350
+  },
+  "channels": {
+    "allowed_channels": [
+      "parlor",
+      "backroom",
+      "broadsheet"
+    ],
+    "channel_blocklist": [],
+    "max_message_bytes": 1024
+  },
+  "storage": {
+    "db_filename": "speakeasy_daemon.db",
+    "message_ttl_days": 30,
+    "vacuum_interval_hours": 24
+  },
+  "logging": {
+    "level": "INFO",
+    "log_to_file": true,
+    "log_file_path": "~/.reti_speakeasy/logs/daemon.log"
+  }
