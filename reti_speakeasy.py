@@ -338,6 +338,54 @@ class BulletinPostModal(ModalScreen[dict]):
         else:
             self.dismiss(None)
 
+class ChannelRequestModal(ModalScreen[dict]):
+    BINDINGS = [
+        ("escape", "dismiss_modal", "Cancel / Close")
+    ]
+
+    CSS = """
+    ChannelRequestModal { align: center middle; }
+    #dialog { width: 60; height: auto; border: thick $accent; background: $surface; padding: 1 2; }
+    #modal-title { width: 100%; text-align: center; text-style: bold; color: $accent; margin-bottom: 1; }
+    .field-label { margin-top: 1; color: $text-muted; }
+    Input { margin-bottom: 1; }
+    #modal-buttons { height: 3; align: center middle; margin-top: 1; }
+    Button { margin: 0 1; }
+    """
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="dialog"):
+            yield Label(" Request New Channel", id="modal-title")
+            yield Label("Channel name (no #):", classes="field-label")
+            yield Input(placeholder="lounge", id="input-channel")
+            yield Label("What is it for?", classes="field-label")
+            yield Input(placeholder="Off-topic chatter", id="input-purpose")
+            yield Label("The hub operator has to approve this.", classes="field-label")
+            with Horizontal(id="modal-buttons"):
+                yield Button("Send Request", variant="success", id="btn-request")
+                yield Button("Cancel [Esc]", variant="error", id="btn-cancel")
+
+    def action_dismiss_modal(self) -> None:
+        self.dismiss(None)
+
+    def on_input_submitted(self, event: Input.Submitted) -> None:
+        self._submit()
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        if event.button.id == "btn-request":
+            self._submit()
+        else:
+            self.dismiss(None)
+
+    def _submit(self) -> None:
+        name = self.query_one("#input-channel", Input).value.strip().lstrip("#")
+        purpose = self.query_one("#input-purpose", Input).value.strip()
+        if not name or not name.replace("-", "").replace("_", "").isalnum():
+            self.notify("Channel names must be alphanumeric (dashes and underscores allowed).",
+                        severity="error")
+            return
+        self.dismiss({"name": name.lower(), "description": purpose})
+
 # -----------------------------------------------------------------------------
 # Reticulum Engine
 # -----------------------------------------------------------------------------
@@ -348,6 +396,10 @@ class ReticulumEngine:
         self.active_host_link = None
         self.current_host_hash = None
         self.auto_failover_enabled = True
+        # Channels the connected host advertised in its FED_HELLO. Anything
+        # outside this set is dropped by the hub, so the client must not
+        # pretend a message to it was delivered.
+        self.host_channels = set()
 
         self.db = SpeakeasyDB(client_db_path(), max_message_bytes=MAX_MESSAGE_CONTENT_BYTES)
         self.rns = RNS.Reticulum()
@@ -459,6 +511,7 @@ class ReticulumEngine:
 
     def _on_link_closed(self, link):
         self.active_host_link = None
+        self.host_channels = set()
         self._notify_ui("system", "[bold red]Disconnected:[/] Host link dropped.")
         self._notify_ui("host_updated", "None")
 
@@ -479,28 +532,60 @@ class ReticulumEngine:
 
     def _on_packet_received(self, message, packet):
         try:
-            opcode, response_frames = self.s2s_engine.process_inbound_frame(message)
-            for resp_bytes in response_frames:
+            result = self.s2s_engine.process_inbound_frame(message)
+            for resp_bytes in result.frames:
                 RNS.Packet(packet.link, resp_bytes).send()
 
-            if opcode == Opcode.BULLETIN_POST:
+            if result.hello_channels:
+                self.host_channels = set(result.hello_channels)
+                self._notify_ui("channels_updated", sorted(self.host_channels))
+
+            for name in result.accepted_channels:
+                self.host_channels.add(name)
+                self._notify_ui("system", f"[bold green]New channel:[/] #{name} was approved by an operator.")
+                self._notify_ui("channels_updated", sorted(self.host_channels))
+
+            if result.opcode == Opcode.BULLETIN_POST:
                 self._notify_ui("refresh_bbs", None)
             else:
                 self._notify_ui("refresh_chat", None)
         except Exception as e:
             self._notify_ui("system", f"Failed to process packet: {e}")
 
-    def broadcast_chat_message(self, channel: str, text: str):
+    def _host_link_active(self) -> bool:
+        return bool(self.active_host_link and self.active_host_link.status == RNS.Link.ACTIVE)
+
+    def broadcast_chat_message(self, channel: str, text: str) -> bool:
+        if not self._host_link_active():
+            self._notify_ui("system", "[bold red]Not sent:[/] no active host link. "
+                                      "Press H to connect to a hub.")
+            return False
+
+        # The hub silently discards channels it does not carry, so refuse here
+        # rather than storing a message locally that nobody else will ever see.
+        if self.host_channels and channel not in self.host_channels:
+            self._notify_ui("system", f"[bold red]Not sent:[/] the host does not carry #{channel}. "
+                                      f"Press N to request it from the operator.")
+            return False
+
         msg_record = self.db.sign_and_insert_message(self.identity, channel, text)
         if not msg_record:
             self._notify_ui("system", f"[bold red]Not sent:[/] messages are limited to "
                                       f"{MAX_MESSAGE_CONTENT_BYTES} bytes.")
-            return
+            return False
 
-        push_frames = self.s2s_engine.build_delta_push_chunks([msg_record])
-        if self.active_host_link and self.active_host_link.status == RNS.Link.ACTIVE:
-            for frame in push_frames:
-                RNS.Packet(self.active_host_link, frame).send()
+        for frame in self.s2s_engine.build_delta_push_chunks([msg_record]):
+            RNS.Packet(self.active_host_link, frame).send()
+        return True
+
+    def request_channel(self, name: str, description: str) -> bool:
+        if not self._host_link_active():
+            self._notify_ui("system", "[bold red]Request failed:[/] no active host link.")
+            return False
+
+        RNS.Packet(self.active_host_link, self.s2s_engine.build_channel_req(name, description)).send()
+        self._notify_ui("system", f"[bold yellow]Requested:[/] #{name} is awaiting operator approval.")
+        return True
 
     def broadcast_bulletin(self, title: str, body: str) -> str:
         bulletin_record = self.db.sign_and_add_bulletin(self.identity, title, body)
@@ -537,6 +622,7 @@ class RetiSpeakeasyApp(App):
         ("h", "show_host_modal", "Select Host"),
         ("p", "show_profile_modal", "Edit Profile"),
         ("b", "show_bulletin_modal", "New Bulletin"),
+        ("n", "show_channel_request_modal", "Request Channel"),
     ]
 
     def compose(self) -> ComposeResult:
@@ -556,6 +642,7 @@ class RetiSpeakeasyApp(App):
                 yield Button(" Select Host (H)", id="btn-host-open", classes="sidebar-btn", variant="primary")
                 yield Button(" Edit Profile (P)", id="btn-profile-open", classes="sidebar-btn", variant="default")
                 yield Button(" New Bulletin (B)", id="btn-bulletin-open", classes="sidebar-btn", variant="success")
+                yield Button(" Request Channel (N)", id="btn-channel-open", classes="sidebar-btn", variant="warning")
                 yield Label(" System Log", classes="widget-header")
                 yield RichLog(id="system-log", classes="chat-log", highlight=True, markup=True)
             with Vertical(id="main-area"):
@@ -607,7 +694,7 @@ class RetiSpeakeasyApp(App):
             history = self.engine.db.get_channel_messages(clean_chan_id, limit=50)
             for msg in history:
                 sender = msg.get("alias") or (msg["sender_hash"][:10] if msg.get("sender_hash") else "Unknown")
-                log_widget.write(f"[bold cyan]\\[{escape(sender)}\\]:[/] {escape(msg['content'])}")
+                log_widget.write(f"[bold cyan]\\[{escape(sender)}]:[/] {escape(msg['content'])}")
 
     def reload_bulletin_board(self) -> None:
         table = self.query_one("#bbs-table", DataTable)
@@ -664,6 +751,33 @@ class RetiSpeakeasyApp(App):
 
         self.push_screen(ProfileModal(current_profile=profile), handle_profile)
 
+    def sync_channel_tabs(self, channel_names) -> None:
+        """Adds a tab for every channel the host carries that is not shown yet."""
+        tabs = self.query_one("#channel-tabs", TabbedContent)
+        for name in channel_names:
+            clean_id = str(name).lstrip("#")
+            if not clean_id:
+                continue
+            try:
+                self.query_one(f"#log-{clean_id}", RichLog)
+                continue
+            except Exception:
+                pass
+            self.engine.db.add_channel(clean_id, f"Channel #{clean_id}")
+            tabs.add_pane(TabPane(
+                f"#{clean_id}",
+                RichLog(id=f"log-{clean_id}", classes="chat-log", highlight=True, markup=True),
+                id=f"tab-{clean_id}",
+            ))
+        self.reload_all_chat_logs()
+
+    def action_show_channel_request_modal(self) -> None:
+        def handle_request(data: dict | None) -> None:
+            if data:
+                self.engine.request_channel(data["name"], data["description"])
+
+        self.push_screen(ChannelRequestModal(), handle_request)
+
     def action_show_bulletin_modal(self) -> None:
         def handle_bulletin(data: dict | None) -> None:
             if data:
@@ -680,19 +794,24 @@ class RetiSpeakeasyApp(App):
             self.action_show_profile_modal()
         elif event.button.id in ("btn-bulletin-open", "btn-bbs-post"):
             self.action_show_bulletin_modal()
+        elif event.button.id == "btn-channel-open":
+            self.action_show_channel_request_modal()
 
     def handle_engine_event(self, event_type: str, data) -> None:
         def update_ui() -> None:
             if event_type == "system":
                 try:
                     sys_log = self.query_one("#system-log", RichLog)
-                    sys_log.write(f"[bold yellow]Sys:[/] {escape(str(data))}")
+                    # Engine messages carry their own Rich markup.
+                    sys_log.write(f"[bold yellow]Sys:[/] {data}")
                 except Exception:
                     pass
             elif event_type == "refresh_chat":
                 self.reload_all_chat_logs()
             elif event_type == "refresh_bbs":
                 self.reload_bulletin_board()
+            elif event_type == "channels_updated":
+                self.sync_channel_tabs(data or [])
             elif event_type == "host_updated":
                 self.query_one("#host-label", Label).update(f"[bold green]{escape(str(data))}[/]")
 
@@ -709,8 +828,7 @@ class RetiSpeakeasyApp(App):
         text = event.value.strip()
         if text:
             curr_chan = self.get_current_channel()
-            if curr_chan != "bbs":
-                self.engine.broadcast_chat_message(curr_chan, text)
+            if curr_chan != "bbs" and self.engine.broadcast_chat_message(curr_chan, text):
                 self.reload_all_chat_logs()
             event.input.value = ""
 

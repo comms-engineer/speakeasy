@@ -29,8 +29,8 @@ class Hub:
     def learn(self, other):
         self.db.upsert_identity(other.identity.hash.hex(), "peer", other.identity.get_public_key())
 
-    def deliver(self, frame, accepted=None):
-        return self.engine.process_inbound_frame(frame, accepted)
+    def deliver(self, frame):
+        return self.engine.process_inbound_frame(frame)
 
     def close(self):
         self.db.close()
@@ -45,8 +45,7 @@ def exchange(sender: Hub, receiver: Hub, frames, max_rounds=12):
             break
         responses = []
         for frame in pending:
-            _, out = dst.deliver(frame)
-            responses.extend(out)
+            responses.extend(dst.deliver(frame).frames)
         pending = responses
         src, dst = dst, src
     return pending
@@ -104,17 +103,16 @@ def test_matching_epoch_roots_produce_no_delta_request(hubs):
                                       ("msg_id", "channel", "sender_hash", "content", "timestamp", "signature")})
 
     epoch = alpha.db.current_epoch()
-    _, frames = beta.deliver(alpha.engine.build_epoch_sync_resp([("parlor", epoch)]))
+    result = beta.deliver(alpha.engine.build_epoch_sync_resp([("parlor", epoch)]))
 
-    assert frames == []
+    assert result.frames == []
 
 
 def test_mismatched_epoch_bucket_aborts_sync(tmp_path):
     alpha = Hub(tmp_path / "a.db", epoch_bucket_sec=300)
     beta = Hub(tmp_path / "b.db", epoch_bucket_sec=3600)
     try:
-        _, frames = alpha.deliver(beta.engine.build_hello(["parlor"]))
-        assert frames == []
+        assert alpha.deliver(beta.engine.build_hello(["parlor"])).frames == []
     finally:
         alpha.close()
         beta.close()
@@ -133,10 +131,9 @@ def test_forged_message_is_not_stored_or_acknowledged(hubs):
     forged["sender_hash"] = author.hash.hex()
     forged["signature"] = impostor.sign(b"whatever")
 
-    accepted = []
-    beta.deliver(alpha.engine.build_delta_push_chunks([honest, forged])[0], accepted)
+    result = beta.deliver(alpha.engine.build_delta_push_chunks([honest, forged])[0])
 
-    assert accepted == [honest["msg_id"]]
+    assert result.accepted_msg_ids == [honest["msg_id"]]
     assert beta.db.get_message("d" * 64) is None
 
 
@@ -153,10 +150,9 @@ def test_bad_signature_does_not_suppress_the_genuine_record(hubs):
     beta.deliver(alpha.engine.build_delta_push_chunks([poisoned])[0])
     assert beta.db.get_message(genuine["msg_id"]) is None
 
-    accepted = []
-    beta.deliver(alpha.engine.build_delta_push_chunks([genuine])[0], accepted)
+    result = beta.deliver(alpha.engine.build_delta_push_chunks([genuine])[0])
 
-    assert accepted == [genuine["msg_id"]]
+    assert result.accepted_msg_ids == [genuine["msg_id"]]
     assert beta.db.get_message(genuine["msg_id"])["content"] == "the real thing"
 
 
@@ -178,8 +174,7 @@ def test_relay_frames_are_rebuilt_from_verified_storage(hubs):
     beta.db.upsert_identity(author.hash.hex(), "author", author.get_public_key())
     record = alpha.db.sign_and_insert_message(author, "parlor", "relay me")
 
-    accepted = []
-    beta.deliver(alpha.engine.build_delta_push_chunks([record])[0], accepted)
+    accepted = beta.deliver(alpha.engine.build_delta_push_chunks([record])[0]).accepted_msg_ids
     relay = beta.engine.build_relay_frames(accepted, hop_count=1)
 
     assert len(relay) == 1
@@ -206,9 +201,8 @@ def test_profile_sync_teaches_public_key_then_verifies(hubs):
     assert beta.db.find_profile(author.hash.hex())["handle"] == "operator"
 
     message = alpha.db.sign_and_insert_message(author, "parlor", "now verifiable")
-    accepted = []
-    beta.deliver(alpha.engine.build_delta_push_chunks([message])[0], accepted)
-    assert accepted == [message["msg_id"]]
+    result = beta.deliver(alpha.engine.build_delta_push_chunks([message])[0])
+    assert result.accepted_msg_ids == [message["msg_id"]]
 
 
 def test_profile_sync_with_mismatched_key_is_not_stored(hubs):
@@ -226,15 +220,31 @@ def test_profile_sync_with_mismatched_key_is_not_stored(hubs):
     assert beta.db.find_profile(author.hash.hex()) is None
 
 
-def test_channel_add_respects_policy(tmp_path):
+def test_unsigned_channel_add_is_refused(tmp_path):
     hub = Hub(tmp_path / "policy.db", allowed_channels={"parlor"})
     peer = Hub(tmp_path / "peer.db")
     try:
-        hub.deliver(peer.engine.build_channel_add("spam", "unwanted"))
-        assert "spam" not in hub.db.get_channel_names()
+        forged = {"name": "spam", "description": "unwanted",
+                  "approver_hash": peer.identity.hash.hex(), "created_at": time.time(),
+                  "signature": b"\x00" * 64}
+        hub.deliver(peer.engine.build_channel_add(forged))
 
-        hub.deliver(peer.engine.build_channel_add("parlor", "allowed"))
-        assert "parlor" in hub.db.get_channel_names()
+        assert "spam" not in hub.db.get_channel_names()
+    finally:
+        hub.close()
+        peer.close()
+
+
+def test_blocklisted_channel_is_never_added(tmp_path):
+    hub = Hub(tmp_path / "blocked.db", allowed_channels={"parlor"})
+    peer = Hub(tmp_path / "peer.db")
+    hub.engine.channel_blocklist = {"spam"}
+    try:
+        hub.learn(peer)
+        record = peer.db.sign_and_add_channel(peer.identity, "spam", "unwanted")
+        hub.deliver(peer.engine.build_channel_add(record))
+
+        assert "spam" not in hub.db.get_channel_names()
     finally:
         hub.close()
         peer.close()

@@ -147,12 +147,32 @@ class SpeakeasyDB:
                 )
             """)
 
-            # Channels table
+            # Channels table. approver_hash/signature are populated for
+            # channels approved by a hub operator; locally seeded channels
+            # leave them NULL and are never gossiped.
             cursor.execute("""
                 CREATE TABLE IF NOT EXISTS channels (
                     name TEXT PRIMARY KEY,
                     description TEXT,
-                    created_at REAL
+                    created_at REAL,
+                    approver_hash TEXT,
+                    signature BLOB
+                )
+            """)
+            existing_cols = {row[1] for row in cursor.execute("PRAGMA table_info(channels)")}
+            for column, decl in (("approver_hash", "TEXT"), ("signature", "BLOB")):
+                if column not in existing_cols:
+                    cursor.execute(f"ALTER TABLE channels ADD COLUMN {column} {decl}")
+
+            # Channel creation requests awaiting an operator decision.
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS channel_requests (
+                    name TEXT PRIMARY KEY,
+                    description TEXT,
+                    requester_hash TEXT,
+                    requested_at REAL,
+                    status TEXT,
+                    decided_at REAL
                 )
             """)
 
@@ -196,6 +216,28 @@ class SpeakeasyDB:
             except ValueError:
                 return None
         return None
+
+    def get_identity_record(self, identity_hash: str) -> Optional[Dict[str, Any]]:
+        """Identity row including public key bytes, or None when unknown."""
+        with self._tx() as cursor:
+            cursor.execute("SELECT * FROM identities WHERE identity_hash = ?", (identity_hash,))
+            row = cursor.fetchone()
+        if not row:
+            return None
+        record = dict(row)
+        record["public_key"] = self._as_blob(record.get("public_key")) or record.get("public_key")
+        return record
+
+    def get_recent_identity_hashes(self, limit: int = 100) -> List[str]:
+        """Most recently seen identities that carry a public key."""
+        with self._tx() as cursor:
+            cursor.execute("""
+                SELECT identity_hash FROM identities
+                WHERE public_key IS NOT NULL
+                ORDER BY updated_at DESC
+                LIMIT ?
+            """, (limit,))
+            return [row[0] for row in cursor.fetchall()]
 
     def get_public_key(self, identity_hash: str) -> Optional[bytes]:
         """
@@ -522,6 +564,129 @@ class SpeakeasyDB:
         with self._tx() as cursor:
             cursor.execute("SELECT * FROM channels ORDER BY name ASC")
             return [dict(row) for row in cursor.fetchall()]
+
+    def get_channel(self, name: str) -> Optional[Dict[str, Any]]:
+        with self._tx() as cursor:
+            cursor.execute("SELECT * FROM channels WHERE name = ?", (name,))
+            row = cursor.fetchone()
+        return dict(row) if row else None
+
+    def get_signed_channels(self) -> List[Dict[str, Any]]:
+        """Operator-approved channels, i.e. the ones that can be federated."""
+        with self._tx() as cursor:
+            cursor.execute("SELECT * FROM channels WHERE signature IS NOT NULL ORDER BY name ASC")
+            return [dict(row) for row in cursor.fetchall()]
+
+    def sign_and_add_channel(self, identity: RNS.Identity, name: str,
+                             description: str = "") -> Optional[Dict[str, Any]]:
+        """Approves a channel under the operator's hub identity, making it federatable."""
+        approver_hash = identity.hash.hex()
+        created_at = time.time()
+        canonical = signing.canonical_channel_bytes(name, description, approver_hash, created_at)
+        sig = signing.sign_bytes(identity, canonical)
+
+        # Peers verify the approval against this key, so it has to travel with
+        # the channel; a hub that never recorded its own key cannot ship it.
+        self.upsert_identity(identity_hash=approver_hash, public_key=identity.get_public_key())
+
+        with self._tx() as cursor:
+            cursor.execute("""
+                INSERT INTO channels (name, description, created_at, approver_hash, signature)
+                VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(name) DO UPDATE SET
+                    description = excluded.description,
+                    created_at = excluded.created_at,
+                    approver_hash = excluded.approver_hash,
+                    signature = excluded.signature
+            """, (name, description, created_at, approver_hash, sig))
+
+        return {
+            "name": name,
+            "description": description,
+            "created_at": created_at,
+            "approver_hash": approver_hash,
+            "signature": sig,
+        }
+
+    def verify_and_add_channel(self, name: str, description: str, approver_hash: str,
+                               created_at: float, signature: bytes,
+                               public_key: Optional[bytes] = None) -> bool:
+        """
+        Stores a channel approved by a remote hub operator, if the approval
+        signature checks out. Returns False when the channel is already known
+        with an equal-or-newer approval, so replays are idempotent.
+        """
+        try:
+            signer_bytes = bytes.fromhex(approver_hash)
+        except (ValueError, TypeError):
+            return False
+
+        if float(created_at) > time.time() + MAX_CLOCK_SKEW_SEC:
+            logger.warning(f"Rejected channel #{name}: created_at too far in the future")
+            return False
+
+        key = public_key or self.get_public_key(approver_hash)
+        canonical = signing.canonical_channel_bytes(name, description, approver_hash, created_at)
+        if not signing.verify_bytes(signer_bytes, signature, canonical, public_key_bytes=key):
+            logger.warning(f"Rejected channel #{name} approved by {approver_hash[:10]}: signature invalid")
+            return False
+
+        existing = self.get_channel(name)
+        if existing and existing.get("signature") and float(existing.get("created_at") or 0) >= float(created_at):
+            return False
+
+        with self._tx() as cursor:
+            cursor.execute("""
+                INSERT INTO channels (name, description, created_at, approver_hash, signature)
+                VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(name) DO UPDATE SET
+                    description = excluded.description,
+                    created_at = excluded.created_at,
+                    approver_hash = excluded.approver_hash,
+                    signature = excluded.signature
+            """, (name, description, created_at, approver_hash, signature))
+        return True
+
+    # ----------------------------------------------------------------------
+    # Channel Requests
+    # ----------------------------------------------------------------------
+
+    def add_channel_request(self, name: str, description: str, requester_hash: str) -> bool:
+        """Queues a channel proposal for the operator. Re-requests are no-ops."""
+        if self.get_channel(name):
+            return False
+        with self._tx() as cursor:
+            cursor.execute("SELECT status FROM channel_requests WHERE name = ?", (name,))
+            row = cursor.fetchone()
+            if row and row[0] == "pending":
+                return False
+            cursor.execute("""
+                INSERT INTO channel_requests (name, description, requester_hash, requested_at, status, decided_at)
+                VALUES (?, ?, ?, ?, 'pending', NULL)
+                ON CONFLICT(name) DO UPDATE SET
+                    description = excluded.description,
+                    requester_hash = excluded.requester_hash,
+                    requested_at = excluded.requested_at,
+                    status = 'pending',
+                    decided_at = NULL
+            """, (name, description, requester_hash, time.time()))
+        return True
+
+    def get_channel_requests(self, status: Optional[str] = "pending") -> List[Dict[str, Any]]:
+        with self._tx() as cursor:
+            if status:
+                cursor.execute("SELECT * FROM channel_requests WHERE status = ? ORDER BY requested_at ASC", (status,))
+            else:
+                cursor.execute("SELECT * FROM channel_requests ORDER BY requested_at ASC")
+            return [dict(row) for row in cursor.fetchall()]
+
+    def set_channel_request_status(self, name: str, status: str) -> bool:
+        with self._tx() as cursor:
+            cursor.execute(
+                "UPDATE channel_requests SET status = ?, decided_at = ? WHERE name = ?",
+                (status, time.time(), name)
+            )
+            return cursor.rowcount > 0
 
     def get_channel_names(self) -> List[str]:
         """Returns a list of channel name strings for protocol sync frames."""

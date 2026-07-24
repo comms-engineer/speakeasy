@@ -40,7 +40,12 @@ def test_every_builder_round_trips(engine):
     profile = engine.db.sign_and_upsert_profile(identity, "operator", "on air", "bio")
 
     builders = {
-        Opcode.CHANNEL_ADD: engine.build_channel_add("backroom", "quiet corner"),
+        Opcode.CHANNEL_ADD: engine.build_channel_add(
+            engine.db.sign_and_add_channel(identity, "backroom", "quiet corner")
+        ),
+        Opcode.CHANNEL_REQ: engine.build_channel_req("lounge", "off-topic"),
+        Opcode.IDENTITY_PUSH: engine.build_identity_push(identity.hash.hex()),
+        Opcode.IDENTITY_REQ: engine.build_identity_req([identity.hash.hex()]),
         Opcode.PROFILE_SYNC: engine.build_profile_sync(profile),
         Opcode.BULLETIN_POST: engine.build_bulletin_post(bulletin),
         Opcode.EPOCH_SYNC_REQ: engine.build_epoch_sync_req([("parlor", 7)]),
@@ -87,10 +92,10 @@ def test_oversized_single_message_is_flagged_not_batched(engine, caplog):
 
 
 def test_malformed_frame_is_rejected(engine):
-    opcode, frames = engine.process_inbound_frame(b"not-msgpack")
+    result = engine.process_inbound_frame(b"not-msgpack")
 
-    assert opcode is None
-    assert frames == []
+    assert result.opcode is None
+    assert result.frames == []
 
 
 def test_merkle_root_is_order_independent_and_empty_is_zero():
