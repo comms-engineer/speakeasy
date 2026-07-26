@@ -7,7 +7,14 @@ import time
 import msgpack
 import RNS
 
-from fed_engine import MAX_MESSAGE_CONTENT_BYTES, Opcode, S2SProtocolEngine
+import blackhole
+from fed_engine import (
+    DEFAULT_SYNC_HISTORY_DAYS,
+    MAX_MESSAGE_CONTENT_BYTES,
+    MAX_SYNC_EPOCHS,
+    Opcode,
+    S2SProtocolEngine,
+)
 from operator_iface import OperatorInterface
 from speakeasy_db import BandwidthClass, SpeakeasyDB, DEFAULT_EPOCH_BUCKET_SEC
 
@@ -72,6 +79,7 @@ class SpeakeasyDaemon:
         self.announce_handler = None
         self.propagated_channels = set()
         self.channels_seeded = False
+        self.sync_offset = 0
 
         node_cfg = self.config.get("node", {})
         fed_cfg = self.config.get("federation", {})
@@ -89,6 +97,17 @@ class SpeakeasyDaemon:
         self.channel_blocklist = set(chan_cfg.get("channel_blocklist") or ())
         self.message_ttl_days = storage_cfg.get("message_ttl_days", 0)
         self.vacuum_interval = storage_cfg.get("vacuum_interval_hours", 24) * 3600
+        self.max_messages_per_channel = int(storage_cfg.get("max_messages_per_channel", 0) or 0)
+        self.max_db_bytes = int(float(storage_cfg.get("max_db_mb", 0) or 0) * 1024 * 1024)
+        self.prune_interval = float(storage_cfg.get("prune_interval_hours", 1) or 0) * 3600
+
+        # Never chase history this node would immediately delete: syncing
+        # further back than the retention window makes two hubs trade the same
+        # messages forever, each pruning what the other just sent.
+        history_days = float(fed_cfg.get("max_sync_history_days", DEFAULT_SYNC_HISTORY_DAYS))
+        if self.message_ttl_days:
+            history_days = min(history_days, float(self.message_ttl_days))
+        self.sync_history_days = history_days
 
         mod_cfg = self.config.get("moderation", {})
         self.operator_lxmf_hash = mod_cfg.get("operator_lxmf_hash") or ""
@@ -142,6 +161,7 @@ class SpeakeasyDaemon:
             allowed_channels=self.allowed_channels or None,
             channel_blocklist=self.channel_blocklist,
             accept_channel_requests=self.accept_channel_requests,
+            sync_history_days=self.sync_history_days,
         )
 
         # 5. Peer discovery & operator control
@@ -194,6 +214,11 @@ class SpeakeasyDaemon:
             return json.load(f)
 
     def _on_inbound_link(self, link):
+        remote = link.get_remote_identity()
+        if remote and blackhole.is_blackholed(remote.hash):
+            logger.info(f"Refused inbound link from blackholed identity [{remote.hash.hex()[:10]}]")
+            link.teardown()
+            return
         if len(self.active_links) >= self.max_clients:
             logger.warning(f"Refused inbound link: at capacity ({self.max_clients} clients).")
             link.teardown()
@@ -264,6 +289,13 @@ class SpeakeasyDaemon:
         return len(peers)
 
     def _on_remote_identified(self, link, remote_identity):
+        if remote_identity and blackhole.is_blackholed(remote_identity.hash):
+            # A link identifies after establishment, so this is the first point
+            # at which a blackholed peer can be recognised.
+            logger.info(f"Tearing down link from blackholed identity "
+                        f"[{remote_identity.hash.hex()[:10]}]")
+            link.teardown()
+            return
         if remote_identity:
             self._register_remote_identity(remote_identity)
             # Everyone else needs this key to verify what this peer posts.
@@ -389,6 +421,10 @@ class SpeakeasyDaemon:
         if not announced_identity or announced_identity.hash == self.identity.hash:
             return
 
+        if blackhole.is_blackholed(announced_identity.hash):
+            logger.info(f"Ignored announce from blackholed hub [{announced_identity.hash.hex()[:10]}]")
+            return
+
         peer_hex = destination_hash.hex()
         if peer_hex in self.discovered_peers:
             return
@@ -450,7 +486,7 @@ class SpeakeasyDaemon:
             if len(self.active_links) >= self.max_clients:
                 logger.info("At link capacity; deferring discovered peer connections.")
                 return
-            if self._is_connected_to(identity):
+            if self._is_connected_to(identity) or blackhole.is_blackholed(identity.hash):
                 continue
             try:
                 self._link_to(identity, peer_hex)
@@ -494,24 +530,73 @@ class SpeakeasyDaemon:
         last_sync = 0
         last_announce = time.time()
         last_vacuum = time.time()
+        last_prune = 0.0
         while self.running:
             now = time.time()
             if now - last_sync >= self.sync_interval:
                 self.maintain_static_peers()
                 self.connect_discovered_peers()
                 self.propagate_new_channels()
+                self.run_sync_round()
                 last_sync = now
 
             if now - last_announce >= self.announce_interval:
                 self.announce_host()
                 last_announce = now
 
+            if self.prune_interval > 0 and now - last_prune >= self.prune_interval:
+                self.enforce_retention()
+                last_prune = now
+
             if self.vacuum_interval > 0 and now - last_vacuum >= self.vacuum_interval:
-                pruned = self.db.prune_messages(self.message_ttl_days)
-                logger.info(f"Retention sweep removed {pruned} expired message(s).")
+                self.db.vacuum()
+                logger.info(f"Vacuumed database ({self.db.db_size_bytes() // 1024} KiB on disk).")
                 last_vacuum = now
 
             time.sleep(1)
+
+    def run_sync_round(self):
+        """
+        Asks every live peer to reconcile one window of history.
+
+        Link establishment alone is not enough: it only ever reconciles what
+        both sides happen to name at that moment, so a hub that joins an
+        existing mesh stays permanently missing everything posted before it
+        arrived. Each round advances a cursor further back through the
+        retention window and wraps around, so backfill completes over a few
+        rounds instead of flooding one link with the entire archive.
+        """
+        channels = self.db.get_channel_names()
+        frame = self.s2s_engine.build_sync_request(channels, offset=self.sync_offset)
+        if not frame:
+            return
+
+        peers = self._broadcast([frame])
+        window = self.s2s_engine.sync_targets(channels, offset=self.sync_offset)
+        # Short window means the cursor ran past the oldest populated epoch, so
+        # start the next sweep from the newest again.
+        self.sync_offset = self.sync_offset + MAX_SYNC_EPOCHS if len(window) >= MAX_SYNC_EPOCHS else 0
+        if peers:
+            logger.info(f"Anti-entropy round over {len(window)} channel-epoch(s) to {peers} peer link(s).")
+
+    def enforce_retention(self):
+        """
+        Keeps the database inside its configured budget.
+
+        Runs in three escalating steps -- age, per-channel depth, then a hard
+        size ceiling -- because a hub on a Raspberry Pi or a solar node has a
+        disk budget that history growth must not silently exceed.
+        """
+        expired = self.db.prune_messages(self.message_ttl_days)
+        overflow = self.db.prune_channel_overflow(self.max_messages_per_channel)
+        oversize = self.db.enforce_size_limit(self.max_db_bytes)
+
+        if expired or overflow or oversize:
+            logger.info(
+                f"Retention sweep removed {expired} expired, {overflow} over-cap and "
+                f"{oversize} over-budget message(s); database now "
+                f"{self.db.db_size_bytes() // 1024} KiB."
+            )
 
     def stop(self):
         logger.info("Shutting down daemon...")

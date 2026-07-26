@@ -239,6 +239,37 @@ class SpeakeasyDB:
             """, (limit,))
             return [row[0] for row in cursor.fetchall()]
 
+    def resolve_identity(self, needle: str) -> Optional[str]:
+        """
+        Finds an identity hash from a hash prefix or a handle/alias.
+
+        Blocking someone is done from what the user can actually see on screen
+        -- a handle, or the short hash shown next to it -- not from a full
+        32-character hash they would have to transcribe.
+        """
+        candidate = (needle or "").strip().lstrip("<").rstrip(">").lower()
+        if not candidate:
+            return None
+        with self._tx() as cursor:
+            cursor.execute("""
+                SELECT identity_hash FROM identities WHERE identity_hash LIKE ? || '%'
+                UNION
+                SELECT identity_hash FROM profiles WHERE identity_hash LIKE ? || '%'
+            """, (candidate, candidate))
+            rows = [row[0] for row in cursor.fetchall()]
+            if len(rows) == 1:
+                return rows[0]
+            if len(rows) > 1:
+                return None
+
+            cursor.execute("""
+                SELECT identity_hash FROM profiles WHERE LOWER(handle) = ?
+                UNION
+                SELECT identity_hash FROM identities WHERE LOWER(alias) = ?
+            """, (candidate, candidate))
+            rows = [row[0] for row in cursor.fetchall()]
+        return rows[0] if len(rows) == 1 else None
+
     def get_public_key(self, identity_hash: str) -> Optional[bytes]:
         """
         Queries the identities table first, then profiles, for stored public key bytes.
@@ -475,6 +506,37 @@ class SpeakeasyDB:
             """, (channel, start, end))
             return [dict(row) for row in cursor.fetchall() if row["msg_id"] not in known]
 
+    def get_populated_epochs(self, channels: Iterable[str], since_epoch: int,
+                             limit: int = 48, offset: int = 0) -> List[tuple]:
+        """
+        (channel, epoch) pairs at or after `since_epoch` that actually hold
+        messages, most recent first.
+
+        Anti-entropy walks this rather than every epoch in the retention
+        window: at a 300s bucket, two weeks is 4032 epochs, almost all of them
+        empty on a quiet mesh, and asking about empty epochs costs a Merkle
+        root on the wire for no possible divergence.
+        """
+        names = list(dict.fromkeys(channels))
+        if not names:
+            return []
+        placeholders = ",".join("?" * len(names))
+        with self._tx() as cursor:
+            cursor.execute(f"""
+                SELECT channel, CAST(timestamp / ? AS INTEGER) AS epoch
+                FROM messages
+                WHERE channel IN ({placeholders}) AND timestamp >= ?
+                GROUP BY channel, epoch
+                ORDER BY epoch DESC, channel ASC
+                LIMIT ? OFFSET ?
+            """, (self.epoch_bucket_sec, *names, int(since_epoch) * self.epoch_bucket_sec,
+                  int(limit), int(offset)))
+            return [(row[0], int(row[1])) for row in cursor.fetchall()]
+
+    # ----------------------------------------------------------------------
+    # Retention
+    # ----------------------------------------------------------------------
+
     def prune_messages(self, ttl_days: float) -> int:
         """Deletes messages older than `ttl_days`; returns the number removed."""
         if not ttl_days or ttl_days <= 0:
@@ -483,6 +545,98 @@ class SpeakeasyDB:
         with self._tx() as cursor:
             cursor.execute("DELETE FROM messages WHERE timestamp < ?", (cutoff,))
             return cursor.rowcount
+
+    def prune_channel_overflow(self, max_per_channel: int) -> int:
+        """
+        Caps each channel at its `max_per_channel` newest messages.
+
+        A time-based TTL alone does not bound anything: one busy channel can
+        fill a Pi's SD card well inside the retention window. Pruning per
+        channel rather than globally keeps a quiet channel's history from being
+        evicted by a noisy one.
+        """
+        if not max_per_channel or max_per_channel <= 0:
+            return 0
+        removed = 0
+        with self._tx() as cursor:
+            cursor.execute("""
+                SELECT channel FROM messages
+                GROUP BY channel HAVING COUNT(*) > ?
+            """, (int(max_per_channel),))
+            channels = [row[0] for row in cursor.fetchall()]
+            for channel in channels:
+                cursor.execute("""
+                    DELETE FROM messages WHERE msg_id IN (
+                        SELECT msg_id FROM messages WHERE channel = ?
+                        ORDER BY timestamp DESC LIMIT -1 OFFSET ?
+                    )
+                """, (channel, int(max_per_channel)))
+                removed += cursor.rowcount
+        return removed
+
+    def db_size_bytes(self) -> int:
+        """On-disk size of the database, including as-yet-unreclaimed pages."""
+        with self._tx() as cursor:
+            page_count = cursor.execute("PRAGMA page_count").fetchone()[0]
+            page_size = cursor.execute("PRAGMA page_size").fetchone()[0]
+        return int(page_count) * int(page_size)
+
+    def enforce_size_limit(self, max_bytes: int, batch: int = 200) -> int:
+        """
+        Drops the oldest messages until the database fits `max_bytes`.
+
+        This is the backstop that makes a hub safe to run unattended on a small
+        device: whatever the TTL and per-channel caps allow, the node still
+        degrades by shedding the oldest history instead of filling the disk.
+        Pages freed by a DELETE stay in the file until VACUUM, so each batch is
+        vacuumed before the size is re-measured -- otherwise the loop sees no
+        progress and deletes far more history than the limit requires.
+        """
+        if not max_bytes or max_bytes <= 0:
+            return 0
+
+        removed = 0
+        while self.db_size_bytes() > max_bytes:
+            with self._tx() as cursor:
+                cursor.execute("""
+                    DELETE FROM messages WHERE msg_id IN (
+                        SELECT msg_id FROM messages ORDER BY timestamp ASC LIMIT ?
+                    )
+                """, (int(batch),))
+                deleted = cursor.rowcount
+            if not deleted:
+                # Nothing left to shed: the remaining size is schema, indices
+                # and non-message tables, so stop rather than spin.
+                logger.warning(
+                    f"Database is {self.db_size_bytes()} bytes with no prunable messages left, "
+                    f"over the {max_bytes} byte limit."
+                )
+                break
+            removed += deleted
+            self.vacuum()
+        return removed
+
+    def purge_identity(self, identity_hash: str) -> int:
+        """
+        Removes everything authored by an identity, for use when a user
+        blackholes a spammer: blocking future traffic is not much use if the
+        flood they already sent stays on screen. The identity's public key is
+        kept, so records that arrive before the block propagates are still
+        recognised (and then refused) rather than triggering identity requests.
+        """
+        with self._tx() as cursor:
+            cursor.execute("DELETE FROM messages WHERE sender_hash = ?", (identity_hash,))
+            removed = cursor.rowcount
+            cursor.execute("DELETE FROM bulletins WHERE author_hash = ?", (identity_hash,))
+            removed += cursor.rowcount
+            cursor.execute("DELETE FROM profiles WHERE identity_hash = ?", (identity_hash,))
+        return removed
+
+    def vacuum(self):
+        """Returns free pages to the filesystem. Cannot run inside a transaction."""
+        with self._lock:
+            self._conn.commit()
+            self._conn.execute("VACUUM")
 
     # ----------------------------------------------------------------------
     # Bulletin Management

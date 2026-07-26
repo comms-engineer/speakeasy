@@ -8,7 +8,6 @@ EPOCH_SYNC_RESP -> DELTA_REQ -> DELTA_PUSH.
 import time
 
 import RNS
-import pytest
 
 from fed_engine import MAX_HOP_COUNT, Opcode, S2SProtocolEngine, WireCodec
 from speakeasy_db import BandwidthClass, SpeakeasyDB
@@ -51,13 +50,6 @@ def exchange(sender: Hub, receiver: Hub, frames, max_rounds=12):
     return pending
 
 
-@pytest.fixture
-def hubs(tmp_path):
-    alpha = Hub(tmp_path / "alpha.db")
-    beta = Hub(tmp_path / "beta.db")
-    yield alpha, beta
-    alpha.close()
-    beta.close()
 
 
 def test_two_hubs_converge_on_channel_history(hubs):
@@ -103,7 +95,7 @@ def test_matching_epoch_roots_produce_no_delta_request(hubs):
                                       ("msg_id", "channel", "sender_hash", "content", "timestamp", "signature")})
 
     epoch = alpha.db.current_epoch()
-    result = beta.deliver(alpha.engine.build_epoch_sync_resp([("parlor", epoch)]))
+    result = beta.deliver(alpha.engine.build_epoch_sync_resp([("parlor", epoch)])[0])
 
     assert result.frames == []
 

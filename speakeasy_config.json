@@ -29,6 +29,9 @@
   "storage": {
     "db_filename": "speakeasy_daemon.db",
     "message_ttl_days": 30,
+    "max_messages_per_channel": 5000,
+    "max_db_mb": 64,
+    "prune_interval_hours": 1,
     "vacuum_interval_hours": 24
   },
   "logging": {

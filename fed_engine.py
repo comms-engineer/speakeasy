@@ -1,9 +1,11 @@
 import enum
 import logging
+import time
 from collections import OrderedDict
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Set
 import msgpack
+import blackhole
 import signing
 from speakeasy_db import BandwidthClass, SpeakeasyDB
 
@@ -31,6 +33,18 @@ SEEN_CACHE_LIMIT = 8192
 # overtakes its author's key is lost permanently -- the sender has no reason to
 # ever send it again.
 DEFERRED_RECORD_LIMIT = 512
+
+# How far back a single anti-entropy round reaches. Syncing only the current
+# epoch means a hub joining an existing mesh never receives anything posted
+# before the link came up; syncing every epoch in the retention window at once
+# would put thousands of Merkle roots on the wire. Instead each round covers the
+# most recent populated epochs and successive rounds walk further back.
+DEFAULT_SYNC_HISTORY_DAYS = 14.0
+MAX_SYNC_EPOCHS = 48
+
+# EPOCH_SYNC_RESP carries a 32-byte root per channel-epoch, so a wide sync
+# overruns the MDU unless the response is chunked. Channel names vary in length,
+# so chunks are sized by measuring the packed frame rather than by entry count.
 
 
 class Opcode(enum.IntEnum):
@@ -99,8 +113,10 @@ class S2SProtocolEngine:
 
     def __init__(self, db: SpeakeasyDB, local_hash_bytes: bytes, bandwidth_class: BandwidthClass,
                  allowed_channels: Optional[Set[str]] = None, channel_blocklist: Optional[Set[str]] = None,
-                 accept_channel_requests: bool = False):
+                 accept_channel_requests: bool = False,
+                 sync_history_days: float = DEFAULT_SYNC_HISTORY_DAYS):
         self.db = db
+        self.sync_history_days = float(sync_history_days)
         self.local_hash_bytes = local_hash_bytes
         self.bandwidth_class = bandwidth_class
         self.allowed_channels = set(allowed_channels) if allowed_channels else None
@@ -108,6 +124,24 @@ class S2SProtocolEngine:
         self.accept_channel_requests = accept_channel_requests
         self.seen_msg_ids: OrderedDict = OrderedDict()
         self.deferred_messages: OrderedDict = OrderedDict()
+
+    def _refuse_blackholed(self, identity_hash_hex: str, what: str) -> bool:
+        """
+        True when a record should be dropped because the user blackholed its
+        author. Checked per record rather than cached: `rnpath -B` can be run
+        against a live node, and a block the user just applied should take
+        effect on the next frame, not on the next restart.
+        """
+        if not blackhole.is_blackholed(identity_hash_hex):
+            return False
+        logger.info(f"Dropped {what} from blackholed identity {identity_hash_hex[:10]}")
+        return True
+
+    def sync_horizon_epoch(self) -> int:
+        """Oldest epoch this node will sync, derived from the history window."""
+        if self.sync_history_days <= 0:
+            return self.db.current_epoch()
+        return self.db.epoch_for(time.time() - self.sync_history_days * 86400)
 
     def _mark_seen(self, msg_id: str):
         self.seen_msg_ids[msg_id] = None
@@ -143,7 +177,7 @@ class S2SProtocolEngine:
         rows = []
         for msg_id in msg_ids:
             row = self.db.get_message(msg_id)
-            if row:
+            if row and not blackhole.is_blackholed(row["sender_hash"]):
                 rows.append(row)
         return self.build_delta_push_chunks(rows, hop_count=hop_count) if rows else []
 
@@ -167,6 +201,10 @@ class S2SProtocolEngine:
     def build_identity_frames(self, identity_hashes) -> list:
         frames = []
         for identity_hash in dict.fromkeys(identity_hashes):
+            # Never help a peer verify records from an identity this node has
+            # blackholed: blocking someone should stop us amplifying them too.
+            if blackhole.is_blackholed(identity_hash):
+                continue
             frame = self.build_identity_push(identity_hash)
             if frame:
                 frames.append(frame)
@@ -220,6 +258,8 @@ class S2SProtocolEngine:
         """Re-packs locally stored (therefore verified) profiles for gossip."""
         frames = []
         for identity_hash in dict.fromkeys(identity_hashes):
+            if blackhole.is_blackholed(identity_hash):
+                continue
             record = self.db.find_profile(identity_hash)
             if not record or not record.get("signature"):
                 continue
@@ -258,16 +298,71 @@ class S2SProtocolEngine:
         }
         return WireCodec.pack(Opcode.BULLETIN_POST, self.local_hash_bytes, payload)
 
-    def build_epoch_sync_req(self, channel_epochs: list[tuple[str, int]]) -> bytes:
-        payload = {0: [[chan, epoch] for chan, epoch in channel_epochs]}
+    def build_epoch_sync_req(self, channel_epochs: list[tuple[str, int]],
+                             since_epoch: Optional[int] = None, offset: int = 0) -> bytes:
+        """
+        Asks a peer for Merkle roots.
+
+        `since_epoch` tells the peer how far back this node is willing to
+        reconcile, so it can volunteer roots for epochs it holds and we don't --
+        those are exactly the epochs we cannot name, and without them a joining
+        hub can only ever learn about history it already partly has.
+        """
+        payload: Dict[int, Any] = {0: [[chan, epoch] for chan, epoch in channel_epochs]}
+        if since_epoch is not None:
+            payload[1] = int(since_epoch)
+        if offset:
+            payload[2] = int(offset)
         return WireCodec.pack(Opcode.EPOCH_SYNC_REQ, self.local_hash_bytes, payload)
 
-    def build_epoch_sync_resp(self, channel_epochs: list[tuple[str, int]]) -> bytes:
-        resp_data = []
-        for channel, epoch in channel_epochs:
-            root_hex = self.db.get_epoch_merkle_root(channel, epoch)
-            resp_data.append([channel, epoch, bytes.fromhex(root_hex)])
-        return WireCodec.pack(Opcode.EPOCH_SYNC_RESP, self.local_hash_bytes, {0: resp_data})
+    def build_epoch_sync_resp(self, channel_epochs: list[tuple[str, int]]) -> list[bytes]:
+        frames: list[bytes] = []
+        batch: list = []
+
+        def pack(entries) -> bytes:
+            return WireCodec.pack(Opcode.EPOCH_SYNC_RESP, self.local_hash_bytes, {0: entries})
+
+        for channel, epoch in dict.fromkeys((str(c), int(e)) for c, e in channel_epochs):
+            entry = [channel, epoch, bytes.fromhex(self.db.get_epoch_merkle_root(channel, epoch))]
+            if batch and len(pack(batch + [entry])) > MAX_MDU_PAYLOAD:
+                frames.append(pack(batch))
+                batch = []
+            batch.append(entry)
+
+        if batch:
+            frames.append(pack(batch))
+        return frames
+
+    def sync_targets(self, channels, offset: int = 0) -> list[tuple[str, int]]:
+        """
+        Channel-epochs worth reconciling: the current epoch for every shared
+        channel, plus a window of `MAX_SYNC_EPOCHS` populated epochs starting
+        `offset` back from the newest. Empty epochs are skipped, so a quiet week
+        costs nothing to sync, and successive rounds raising `offset` walk
+        further back through history without ever putting the whole retention
+        window on the wire at once.
+        """
+        shared = [c for c in dict.fromkeys(channels) if c in set(self.db.get_channel_names())]
+        if not shared:
+            return []
+        current = self.db.current_epoch()
+        targets = [(c, current) for c in shared]
+        populated = self.db.get_populated_epochs(
+            shared, self.sync_horizon_epoch(), MAX_SYNC_EPOCHS, offset=offset
+        )
+        for channel, epoch in populated:
+            if (channel, epoch) not in targets:
+                targets.append((channel, epoch))
+        return targets[:MAX_SYNC_EPOCHS]
+
+    def build_sync_request(self, channels, offset: int = 0) -> Optional[bytes]:
+        """One anti-entropy round for `channels`, or None when nothing is shared."""
+        targets = self.sync_targets(channels, offset=offset)
+        if not targets:
+            return None
+        return self.build_epoch_sync_req(
+            targets, since_epoch=self.sync_horizon_epoch(), offset=offset
+        )
 
     def build_delta_req(self, channel: str, epoch: int) -> bytes:
         known_ids = self.db.get_epoch_message_ids(channel, epoch)
@@ -364,12 +459,9 @@ class S2SProtocolEngine:
                 return result
 
             result.hello_channels = channels
-            current_epoch = self.db.current_epoch()
-            local_chan_names = set(self.db.get_channel_names())
-
-            sync_tuples = [(c, current_epoch) for c in channels if c in local_chan_names]
-            if sync_tuples:
-                outbound_frames.append(self.build_epoch_sync_req(sync_tuples))
+            sync_frame = self.build_sync_request(channels)
+            if sync_frame:
+                outbound_frames.append(sync_frame)
 
         elif opcode == Opcode.CHANNEL_ADD:
             chan_name = payload[0]
@@ -381,6 +473,9 @@ class S2SProtocolEngine:
             created_at = payload.get(3) or 0.0
             signature = payload.get(4) or b""
             approver_key = payload.get(5) or None
+
+            if self._refuse_blackholed(approver_hash, f"channel approval for #{chan_name}"):
+                return result
 
             if approver_key:
                 self._learn_identity(payload[2], approver_key, alias="", result=result)
@@ -398,6 +493,8 @@ class S2SProtocolEngine:
         elif opcode == Opcode.CHANNEL_REQ:
             chan_name = str(payload[0])
             desc = str(payload[1] or "")
+            if self._refuse_blackholed(origin_hash.hex(), f"channel request #{chan_name}"):
+                return result
             if not self.accept_channel_requests:
                 logger.info(f"Ignored channel request for #{chan_name}: this node does not take requests")
             elif chan_name in self.channel_blocklist:
@@ -411,6 +508,8 @@ class S2SProtocolEngine:
                 })
 
         elif opcode == Opcode.IDENTITY_PUSH:
+            if self._refuse_blackholed(payload[0].hex(), "identity push"):
+                return result
             self._learn_identity(payload[0], payload[1], alias=str(payload.get(2) or ""), result=result)
             self._retry_deferred(payload[0].hex(), result)
 
@@ -425,6 +524,9 @@ class S2SProtocolEngine:
             edited_at = payload[3]
             signature = payload[4]
             pub_key = payload.get(5) if len(payload) > 5 else None
+
+            if self._refuse_blackholed(origin_hash.hex(), "profile sync"):
+                return result
 
             if pub_key:
                 self._learn_identity(origin_hash, pub_key, alias=str(handle), result=result)
@@ -443,6 +545,8 @@ class S2SProtocolEngine:
             bulletin_id = payload[0].hex()
             title, body, ts = payload[1], payload[2], payload[3]
             signature = payload[4]
+            if self._refuse_blackholed(origin_hash.hex(), "bulletin"):
+                return result
             ok = self.db.verify_and_add_bulletin(
                 bulletin_id=bulletin_id, title=title, body=body,
                 author_hash=origin_hash.hex(), timestamp=ts, signature=signature
@@ -451,7 +555,22 @@ class S2SProtocolEngine:
                 logger.info(f"Discarded bulletin '{str(title)[:30]}' from {origin_hash.hex()[:10]} (failed verification)")
 
         elif opcode == Opcode.EPOCH_SYNC_REQ:
-            outbound_frames.append(self.build_epoch_sync_resp(payload[0]))
+            requested = [(str(c), int(e)) for c, e in payload[0]]
+            since_epoch = payload.get(1)
+            if since_epoch is not None:
+                # Volunteer epochs the requester never mentioned: those are the
+                # ones it has no messages for, i.e. precisely the history it is
+                # missing. Bounded by the requester's own stated horizon so a
+                # peer with a longer retention window cannot force us to
+                # re-offer history this node has deliberately aged out.
+                horizon = max(int(since_epoch), self.sync_horizon_epoch())
+                channels = list(dict.fromkeys(c for c, _ in requested))
+                offset = int(payload.get(2) or 0)
+                for entry in self.db.get_populated_epochs(channels, horizon, MAX_SYNC_EPOCHS,
+                                                          offset=offset):
+                    if entry not in requested:
+                        requested.append(entry)
+            outbound_frames.extend(self.build_epoch_sync_resp(requested[:MAX_SYNC_EPOCHS]))
 
         elif opcode == Opcode.EPOCH_SYNC_RESP:
             for channel, epoch, remote_root_bytes in payload[0]:
@@ -532,6 +651,12 @@ class S2SProtocolEngine:
 
         if msg_id_hex in self.seen_msg_ids or self.db.has_message(msg_id_hex):
             return True
+
+        # Blackholed authors are refused before verification: a blocked
+        # spammer's records are perfectly well signed, so the signature check
+        # would happily let them through.
+        if self._refuse_blackholed(sender_hash_hex, f"message in #{channel}"):
+            return False
 
         if not self.channel_permitted(str(channel)):
             logger.info(f"Discarded message {msg_id_hex[:10]}: channel #{channel} not permitted")
