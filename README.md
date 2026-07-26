@@ -54,6 +54,26 @@ symmetric: both sides end an exchange with the same records. Peers must agree on
 `federation.epoch_bucket_sec`, otherwise epoch roots can never match — mismatches are
 detected at `FED_HELLO` and logged.
 
+### Historical backfill
+
+A hub joining an existing mesh inherits history, not just new traffic. Two details make
+that work:
+
+- **The responder volunteers epochs.** A hub with an empty database cannot *name* a single
+  historical epoch to ask about, so `EPOCH_SYNC_REQ` also carries how far back the requester
+  is willing to reconcile, and the peer offers roots for populated epochs inside that
+  horizon. Without this, two hubs only ever compare the epoch they are both currently in —
+  where they trivially agree — and history predating the link is never transferred.
+- **Backfill is bounded, not a bulk transfer.** Only epochs that actually hold messages are
+  compared, so a quiet fortnight costs nothing (at a 300 s bucket, two weeks is over 4000
+  epochs, nearly all empty). Each round covers at most `MAX_SYNC_EPOCHS` channel-epochs and
+  successive rounds walk the window further back, wrapping around when they reach the
+  oldest history. Merkle responses are chunked to fit the MDU.
+
+The horizon is `federation.max_sync_history_days`, clamped to `storage.message_ttl_days`:
+chasing history the node would delete on its next retention sweep would make two hubs trade
+the same records forever.
+
 ### Peer discovery
 
 With `federation.auto_discover_peers` enabled (the default) a hub registers an RNS announce
@@ -81,6 +101,64 @@ python speakeasy_admin.py pending
 python speakeasy_admin.py approve lounge
 python speakeasy_admin.py deny spam
 ```
+
+> **Not yet verified on real hardware:** the LXMF path has only been smoke-tested — the
+> endpoint starts and announces, and the source-hash authorisation is in place, but issuing
+> `approve <channel>` from a second live LXMF peer (Sideband, MeshChat) has not been
+> exercised end to end. Confirm it when running a hub on your own hardware with
+> `moderation.operator_lxmf_hash` pointed at your own address; the CLI above drives the same
+> queue in the meantime.
+
+## Storage on small hardware
+
+Much of Reticulum runs on a Pi or a similar SBC with an SD card, so an unbounded message
+table is a real failure mode — the node dies of a full disk instead of degrading by
+forgetting old chatter. Retention is applied in three escalating steps on a timer
+(`storage.prune_interval_hours`):
+
+1. **Age** — messages older than `storage.message_ttl_days` are dropped.
+2. **Depth per channel** — each channel keeps at most `storage.max_messages_per_channel`
+   of its newest messages. The cap is per channel rather than global so one flooded channel
+   cannot evict a quiet one's entire history.
+3. **Hard ceiling** — if the database still exceeds `storage.max_db_mb`, the oldest
+   messages are shed until it fits. This is the backstop that makes a hub safe to run
+   unattended.
+
+Only message history is ever pruned. If the database is over budget with no messages left
+to drop — the schema, indexes, identities and profiles alone exceeding the ceiling — the hub
+logs a warning and stops, rather than deleting the keys it needs to verify anyone. Space
+freed by deletes is returned to the filesystem by `VACUUM` on
+`storage.vacuum_interval_hours`; SQLite is in WAL mode, so expect a `-wal` file alongside
+the database in addition to the configured budget. Set any of these limits to `0` to
+disable that step.
+
+## Blocking identities
+
+Speakeasy honours Reticulum's own blackhole list rather than keeping a private blocklist,
+so an identity is blocked once, with standard tooling, for every RNS application on the
+node:
+
+```bash
+rnpath -B <identity_hash>                    # blackhole an identity
+rnpath -B <identity_hash> --duration 24      # ...for 24 hours
+rnpath -b                                    # list blackholed identities
+rnpath -U <identity_hash>                    # lift it
+```
+
+RNS applies the list to *pathing*: announces and paths for a blackholed identity are
+dropped. That alone does nothing about a spammer whose records arrive relayed inside a
+hub's frames, carrying no path of their own — so Speakeasy also applies it at the record
+layer. A blackholed identity's messages, profiles, bulletins, channel requests and channel
+approvals are refused before verification (their records are perfectly well signed, so the
+signature check would happily let them through), their keys are neither learned nor
+gossiped onward, records already stored from them are no longer relayed, and inbound links
+from them are torn down. The list is consulted per record, so a block applied with `rnpath`
+against a running node takes effect on the next frame rather than the next restart.
+
+From the client, `/block <handle|hash>` blackholes an identity node-wide and purges what
+they already posted from the local database, `/unblock` lifts it and `/blocked` lists
+current blocks. Blocked authors are also filtered out of already-stored history when a
+channel is rendered.
 
 ## Running a hub
 
@@ -129,7 +207,12 @@ instead of storing a message nobody will ever receive.
 | `channels.channel_blocklist` | Channels rejected outright |
 | `channels.max_message_bytes` | Maximum message size accepted or signed (capped at `MAX_MESSAGE_CONTENT_BYTES` so a record always fits one frame) |
 | `storage.db_filename` | Database name inside `~/.reti_speakeasy` |
+| `federation.max_sync_history_days` | How far back backfill reconciles; clamped to `storage.message_ttl_days` |
 | `storage.message_ttl_days` | Retention window for the periodic prune sweep |
+| `storage.max_messages_per_channel` | Per-channel message cap; `0` disables |
+| `storage.max_db_mb` | Hard database size ceiling, enforced by shedding oldest history; `0` disables |
+| `storage.prune_interval_hours` | Retention sweep cadence |
+| `storage.vacuum_interval_hours` | How often freed pages are returned to the filesystem |
 | `logging.*` | Log level and optional log file |
 
 ## Development

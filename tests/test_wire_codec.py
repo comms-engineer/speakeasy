@@ -49,7 +49,7 @@ def test_every_builder_round_trips(engine):
         Opcode.PROFILE_SYNC: engine.build_profile_sync(profile),
         Opcode.BULLETIN_POST: engine.build_bulletin_post(bulletin),
         Opcode.EPOCH_SYNC_REQ: engine.build_epoch_sync_req([("parlor", 7)]),
-        Opcode.EPOCH_SYNC_RESP: engine.build_epoch_sync_resp([("parlor", 7)]),
+        Opcode.EPOCH_SYNC_RESP: engine.build_epoch_sync_resp([("parlor", 7)])[0],
         Opcode.DELTA_REQ: engine.build_delta_req("parlor", 7),
     }
 

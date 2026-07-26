@@ -13,6 +13,7 @@ from textual.containers import Horizontal, Vertical
 from textual.screen import ModalScreen
 from textual.widgets import Button, DataTable, Footer, Header, Input, Label, RichLog, TabbedContent, TabPane, TextArea
 
+import blackhole
 from fed_engine import MAX_MESSAGE_CONTENT_BYTES, Opcode, S2SProtocolEngine
 from speakeasy_db import BandwidthClass, SpeakeasyDB
 
@@ -578,6 +579,51 @@ class ReticulumEngine:
             RNS.Packet(self.active_host_link, frame).send()
         return True
 
+    def block_identity(self, needle: str) -> bool:
+        """
+        Blackholes an identity node-wide and forgets what it already posted.
+
+        This writes to Reticulum's own blackhole list rather than a Speakeasy
+        one, so the block is honoured by every RNS application on this node and
+        can be reviewed or lifted with `rnpath -b` / `rnpath -U`.
+        """
+        identity_hash = self.db.resolve_identity(needle)
+        if not identity_hash:
+            self._notify_ui("system", f"[bold red]Unknown identity:[/] {escape(needle)}. "
+                                      f"Use a handle or a hash prefix.")
+            return False
+        if identity_hash == self.identity.hash.hex():
+            self._notify_ui("system", "[bold red]Refused:[/] you cannot blackhole yourself.")
+            return False
+
+        if not blackhole.blackhole(identity_hash, reason="Blocked from Speakeasy"):
+            self._notify_ui("system", f"[bold yellow]Already blocked:[/] {identity_hash[:10]}.")
+            return False
+
+        removed = self.db.purge_identity(identity_hash)
+        self._notify_ui("system", f"[bold green]Blocked:[/] {identity_hash[:10]} is blackholed; "
+                                  f"purged {removed} record(s).")
+        self._notify_ui("refresh_chat", None)
+        self._notify_ui("refresh_bbs", None)
+        return True
+
+    def unblock_identity(self, needle: str) -> bool:
+        identity_hash = self.db.resolve_identity(needle) or (needle or "").strip().lower()
+        if not blackhole.unblackhole(identity_hash):
+            self._notify_ui("system", f"[bold yellow]Not blocked:[/] {escape(needle)}.")
+            return False
+        self._notify_ui("system", f"[bold green]Unblocked:[/] {identity_hash[:10]}.")
+        return True
+
+    def list_blocked(self):
+        blocked = sorted(blackhole.blackholed_hashes())
+        if not blocked:
+            self._notify_ui("system", "No blackholed identities.")
+            return
+        for identity_hash in blocked:
+            handle = self.db.get_profile(identity_hash).get("handle") or "unknown"
+            self._notify_ui("system", f"Blocked: {identity_hash[:10]} ({escape(str(handle))})")
+
     def request_channel(self, name: str, description: str) -> bool:
         if not self._host_link_active():
             self._notify_ui("system", "[bold red]Request failed:[/] no active host link.")
@@ -658,7 +704,8 @@ class RetiSpeakeasyApp(App):
                                 yield Button(" Post New Bulletin", id="btn-bbs-post", variant="success")
                             yield DataTable(id="bbs-table")
                             yield RichLog(id="bbs-viewer", classes="chat-log", highlight=True, markup=True)
-                yield Input(placeholder="Type message and hit Enter...", id="chat-input")
+                yield Input(placeholder="Message, or /block <handle> /unblock <handle> /blocked",
+                            id="chat-input")
         yield Footer()
 
     def on_mount(self) -> None:
@@ -692,7 +739,12 @@ class RetiSpeakeasyApp(App):
 
             log_widget.clear()
             history = self.engine.db.get_channel_messages(clean_chan_id, limit=50)
+            blocked = blackhole.blackholed_hashes()
             for msg in history:
+                # Records already stored when the user blocked the author, or
+                # relayed by a hub that does not share the block.
+                if msg.get("sender_hash") in blocked:
+                    continue
                 sender = msg.get("alias") or (msg["sender_hash"][:10] if msg.get("sender_hash") else "Unknown")
                 log_widget.write(f"[bold cyan]\\[{escape(sender)}]:[/] {escape(msg['content'])}")
 
@@ -797,6 +849,23 @@ class RetiSpeakeasyApp(App):
         elif event.button.id == "btn-channel-open":
             self.action_show_channel_request_modal()
 
+    def handle_command(self, text: str) -> None:
+        command, _, argument = text[1:].partition(" ")
+        argument = argument.strip()
+        command = command.lower()
+
+        if command == "block" and argument:
+            self.engine.block_identity(argument)
+        elif command == "unblock" and argument:
+            self.engine.unblock_identity(argument)
+        elif command == "blocked":
+            self.engine.list_blocked()
+        else:
+            self.handle_engine_event(
+                "system",
+                "[bold yellow]Commands:[/] /block <handle|hash>, /unblock <handle|hash>, /blocked"
+            )
+
     def handle_engine_event(self, event_type: str, data) -> None:
         def update_ui() -> None:
             if event_type == "system":
@@ -826,6 +895,11 @@ class RetiSpeakeasyApp(App):
             return
 
         text = event.value.strip()
+        if text.startswith("/"):
+            self.handle_command(text)
+            event.input.value = ""
+            return
+
         if text:
             curr_chan = self.get_current_channel()
             if curr_chan != "bbs" and self.engine.broadcast_chat_message(curr_chan, text):
