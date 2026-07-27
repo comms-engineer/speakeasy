@@ -132,7 +132,7 @@ class S2SProtocolEngine:
         against a live node, and a block the user just applied should take
         effect on the next frame, not on the next restart.
         """
-        if not blackhole.is_blackholed(identity_hash_hex):
+        if not blackhole.is_blocked(identity_hash_hex, self.db):
             return False
         logger.info(f"Dropped {what} from blackholed identity {identity_hash_hex[:10]}")
         return True
@@ -177,7 +177,7 @@ class S2SProtocolEngine:
         rows = []
         for msg_id in msg_ids:
             row = self.db.get_message(msg_id)
-            if row and not blackhole.is_blackholed(row["sender_hash"]):
+            if row and not blackhole.is_blocked(row["sender_hash"], self.db):
                 rows.append(row)
         return self.build_delta_push_chunks(rows, hop_count=hop_count) if rows else []
 
@@ -203,7 +203,7 @@ class S2SProtocolEngine:
         for identity_hash in dict.fromkeys(identity_hashes):
             # Never help a peer verify records from an identity this node has
             # blackholed: blocking someone should stop us amplifying them too.
-            if blackhole.is_blackholed(identity_hash):
+            if blackhole.is_blocked(identity_hash, self.db):
                 continue
             frame = self.build_identity_push(identity_hash)
             if frame:
@@ -258,7 +258,7 @@ class S2SProtocolEngine:
         """Re-packs locally stored (therefore verified) profiles for gossip."""
         frames = []
         for identity_hash in dict.fromkeys(identity_hashes):
-            if blackhole.is_blackholed(identity_hash):
+            if blackhole.is_blocked(identity_hash, self.db):
                 continue
             record = self.db.find_profile(identity_hash)
             if not record or not record.get("signature"):

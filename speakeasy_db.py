@@ -176,6 +176,19 @@ class SpeakeasyDB:
                 )
             """)
 
+            # Locally blocked identities. Kept here rather than in RNS's
+            # node-wide blackhole table because that table belongs to the master
+            # instance: a shared-instance client writing to it changes only its
+            # own copy, and the next `rnpath -B` overwrites the shared file and
+            # drops the entry. A user's block must survive that.
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS blocked_identities (
+                    identity_hash TEXT PRIMARY KEY,
+                    reason TEXT,
+                    blocked_at REAL
+                )
+            """)
+
             # Epoch sync scans messages by (channel, timestamp) range on every
             # anti-entropy round; the bulletin index backs the board view.
             cursor.execute("CREATE INDEX IF NOT EXISTS idx_messages_channel_ts ON messages (channel, timestamp)")
@@ -581,6 +594,22 @@ class SpeakeasyDB:
             page_size = cursor.execute("PRAGMA page_size").fetchone()[0]
         return int(page_count) * int(page_size)
 
+    def db_payload_bytes(self) -> int:
+        """
+        Size the database would occupy once free pages are reclaimed.
+
+        Retention decisions must use this rather than the on-disk size. A DELETE
+        only moves pages onto SQLite's freelist, so straight after a large prune
+        the file still measures its old size -- and a size check reading that
+        would conclude the prune achieved nothing and delete the entire
+        remaining history while the real payload was a fraction of the budget.
+        """
+        with self._tx() as cursor:
+            page_count = cursor.execute("PRAGMA page_count").fetchone()[0]
+            page_size = cursor.execute("PRAGMA page_size").fetchone()[0]
+            free_pages = cursor.execute("PRAGMA freelist_count").fetchone()[0]
+        return max(0, int(page_count) - int(free_pages)) * int(page_size)
+
     def enforce_size_limit(self, max_bytes: int, batch: int = 200) -> int:
         """
         Drops the oldest messages until the database fits `max_bytes`.
@@ -588,15 +617,19 @@ class SpeakeasyDB:
         This is the backstop that makes a hub safe to run unattended on a small
         device: whatever the TTL and per-channel caps allow, the node still
         degrades by shedding the oldest history instead of filling the disk.
-        Pages freed by a DELETE stay in the file until VACUUM, so each batch is
-        vacuumed before the size is re-measured -- otherwise the loop sees no
-        progress and deletes far more history than the limit requires.
+
+        Measured against `db_payload_bytes()`, discounting pages already on the
+        freelist: an earlier prune in the same sweep leaves the file at its old
+        size until VACUUM, and measuring that would shed history that is already
+        within budget. A single VACUUM at the end returns the pages to the
+        filesystem, rather than one per batch -- repeatedly rewriting the whole
+        database is exactly what an SD card should not be asked to do.
         """
         if not max_bytes or max_bytes <= 0:
             return 0
 
         removed = 0
-        while self.db_size_bytes() > max_bytes:
+        while self.db_payload_bytes() > max_bytes:
             with self._tx() as cursor:
                 cursor.execute("""
                     DELETE FROM messages WHERE msg_id IN (
@@ -608,13 +641,43 @@ class SpeakeasyDB:
                 # Nothing left to shed: the remaining size is schema, indices
                 # and non-message tables, so stop rather than spin.
                 logger.warning(
-                    f"Database is {self.db_size_bytes()} bytes with no prunable messages left, "
+                    f"Database is {self.db_payload_bytes()} bytes with no prunable messages left, "
                     f"over the {max_bytes} byte limit."
                 )
                 break
             removed += deleted
+
+        if removed:
             self.vacuum()
         return removed
+
+    def block_identity(self, identity_hash: str, reason: str = "") -> bool:
+        """Blocks an identity for this node only. False if already blocked."""
+        if self.is_blocked(identity_hash):
+            return False
+        with self._tx() as cursor:
+            cursor.execute(
+                "INSERT OR REPLACE INTO blocked_identities VALUES (?, ?, ?)",
+                (identity_hash, reason, time.time()),
+            )
+        return True
+
+    def unblock_identity(self, identity_hash: str) -> bool:
+        with self._tx() as cursor:
+            cursor.execute("DELETE FROM blocked_identities WHERE identity_hash = ?",
+                           (identity_hash,))
+            return cursor.rowcount > 0
+
+    def is_blocked(self, identity_hash: str) -> bool:
+        with self._tx() as cursor:
+            cursor.execute("SELECT 1 FROM blocked_identities WHERE identity_hash = ?",
+                           (identity_hash,))
+            return cursor.fetchone() is not None
+
+    def blocked_identities(self) -> List[str]:
+        with self._tx() as cursor:
+            cursor.execute("SELECT identity_hash FROM blocked_identities ORDER BY blocked_at")
+            return [row[0] for row in cursor.fetchall()]
 
     def purge_identity(self, identity_hash: str) -> int:
         """

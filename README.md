@@ -124,6 +124,12 @@ forgetting old chatter. Retention is applied in three escalating steps on a time
    messages are shed until it fits. This is the backstop that makes a hub safe to run
    unattended.
 
+The ceiling is measured against the size the database will occupy once free pages are
+reclaimed, not its current size on disk. A `DELETE` only moves pages onto SQLite's freelist,
+so straight after steps 1 and 2 the file still measures its old size — and step 3 reading
+that would conclude the earlier pruning achieved nothing and shed the entire remaining
+history while the real payload sat at a fraction of the budget.
+
 Only message history is ever pruned. If the database is over budget with no messages left
 to drop — the schema, indexes, identities and profiles alone exceeding the ceiling — the hub
 logs a warning and stops, rather than deleting the keys it needs to verify anyone. Space
@@ -134,9 +140,11 @@ disable that step.
 
 ## Blocking identities
 
-Speakeasy honours Reticulum's own blackhole list rather than keeping a private blocklist,
-so an identity is blocked once, with standard tooling, for every RNS application on the
-node:
+Blocking works at two distinct scopes: the **node operator** blackholes an identity for the
+whole node with Reticulum's own tooling, and a **user** blocks someone for their own client
+only. Speakeasy honours both.
+
+The operator scope is RNS's blackhole list, which Speakeasy reads rather than duplicating:
 
 ```bash
 rnpath -B <identity_hash>                    # blackhole an identity
@@ -155,10 +163,19 @@ gossiped onward, records already stored from them are no longer relayed, and inb
 from them are torn down. The list is consulted per record, so a block applied with `rnpath`
 against a running node takes effect on the next frame rather than the next restart.
 
-From the client, `/block <handle|hash>` blackholes an identity node-wide and purges what
-they already posted from the local database, `/unblock` lifts it and `/blocked` lists
-current blocks. Blocked authors are also filtered out of already-stored history when a
-channel is rendered.
+From the client, `/block <handle|hash>` blocks an identity **for that client only** and
+purges what they already posted from its database, `/unblock` lifts it and `/blocked` lists
+both scopes, marking operator blackholes as such. Blocked authors are also filtered out of
+already-stored history when a channel is rendered.
+
+A client block is stored in the client's own database, *not* in RNS's blackhole list, and so
+will not appear in `rnpath -b`. This is deliberate: that list is node-wide state owned by
+the master RNS instance, and Speakeasy processes are normally shared-instance clients, so
+writing to it from a client changes only that process's in-memory copy — and the next
+`rnpath -B` rewrites the shared file wholesale and silently drops the entry. It is also the
+wrong scope: one user muting a bore should not blackhole them for every application on the
+machine. Use `rnpath -B` when you do want a block to apply node-wide, including to a hub's
+federated records.
 
 ## Running a hub
 

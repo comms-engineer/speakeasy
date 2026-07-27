@@ -215,7 +215,7 @@ class SpeakeasyDaemon:
 
     def _on_inbound_link(self, link):
         remote = link.get_remote_identity()
-        if remote and blackhole.is_blackholed(remote.hash):
+        if remote and blackhole.is_blocked(remote.hash, self.db):
             logger.info(f"Refused inbound link from blackholed identity [{remote.hash.hex()[:10]}]")
             link.teardown()
             return
@@ -289,7 +289,7 @@ class SpeakeasyDaemon:
         return len(peers)
 
     def _on_remote_identified(self, link, remote_identity):
-        if remote_identity and blackhole.is_blackholed(remote_identity.hash):
+        if remote_identity and blackhole.is_blocked(remote_identity.hash, self.db):
             # A link identifies after establishment, so this is the first point
             # at which a blackholed peer can be recognised.
             logger.info(f"Tearing down link from blackholed identity "
@@ -421,7 +421,7 @@ class SpeakeasyDaemon:
         if not announced_identity or announced_identity.hash == self.identity.hash:
             return
 
-        if blackhole.is_blackholed(announced_identity.hash):
+        if blackhole.is_blocked(announced_identity.hash, self.db):
             logger.info(f"Ignored announce from blackholed hub [{announced_identity.hash.hex()[:10]}]")
             return
 
@@ -486,7 +486,7 @@ class SpeakeasyDaemon:
             if len(self.active_links) >= self.max_clients:
                 logger.info("At link capacity; deferring discovered peer connections.")
                 return
-            if self._is_connected_to(identity) or blackhole.is_blackholed(identity.hash):
+            if self._is_connected_to(identity) or blackhole.is_blocked(identity.hash, self.db):
                 continue
             try:
                 self._link_to(identity, peer_hex)
@@ -590,6 +590,12 @@ class SpeakeasyDaemon:
         expired = self.db.prune_messages(self.message_ttl_days)
         overflow = self.db.prune_channel_overflow(self.max_messages_per_channel)
         oversize = self.db.enforce_size_limit(self.max_db_bytes)
+
+        if (expired or overflow) and not oversize:
+            # The size stage reclaims its own pages; when it had nothing to do,
+            # the pages the first two stages freed still need returning to the
+            # filesystem, which is the whole point on a fixed disk budget.
+            self.db.vacuum()
 
         if expired or overflow or oversize:
             logger.info(

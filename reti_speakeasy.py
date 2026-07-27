@@ -581,11 +581,14 @@ class ReticulumEngine:
 
     def block_identity(self, needle: str) -> bool:
         """
-        Blackholes an identity node-wide and forgets what it already posted.
+        Blocks an identity for this client and forgets what it already posted.
 
-        This writes to Reticulum's own blackhole list rather than a Speakeasy
-        one, so the block is honoured by every RNS application on this node and
-        can be reviewed or lifted with `rnpath -b` / `rnpath -U`.
+        The block is stored in the client's own database, not in Reticulum's
+        node-wide blackhole list: that list belongs to the master RNS instance,
+        so a shared-instance client writing to it would change only its own copy
+        -- invisible to `rnpath -b` -- and the next `rnpath -B` would overwrite
+        the shared file and drop the entry. Blackholes set by the node's operator
+        with `rnpath -B` are still honoured on top of this.
         """
         identity_hash = self.db.resolve_identity(needle)
         if not identity_hash:
@@ -593,15 +596,15 @@ class ReticulumEngine:
                                       f"Use a handle or a hash prefix.")
             return False
         if identity_hash == self.identity.hash.hex():
-            self._notify_ui("system", "[bold red]Refused:[/] you cannot blackhole yourself.")
+            self._notify_ui("system", "[bold red]Refused:[/] you cannot block yourself.")
             return False
 
-        if not blackhole.blackhole(identity_hash, reason="Blocked from Speakeasy"):
+        if not self.db.block_identity(identity_hash, reason="Blocked from Speakeasy"):
             self._notify_ui("system", f"[bold yellow]Already blocked:[/] {identity_hash[:10]}.")
             return False
 
         removed = self.db.purge_identity(identity_hash)
-        self._notify_ui("system", f"[bold green]Blocked:[/] {identity_hash[:10]} is blackholed; "
+        self._notify_ui("system", f"[bold green]Blocked:[/] {identity_hash[:10]}; "
                                   f"purged {removed} record(s).")
         self._notify_ui("refresh_chat", None)
         self._notify_ui("refresh_bbs", None)
@@ -609,20 +612,31 @@ class ReticulumEngine:
 
     def unblock_identity(self, needle: str) -> bool:
         identity_hash = self.db.resolve_identity(needle) or (needle or "").strip().lower()
-        if not blackhole.unblackhole(identity_hash):
-            self._notify_ui("system", f"[bold yellow]Not blocked:[/] {escape(needle)}.")
+        if not self.db.unblock_identity(identity_hash):
+            if blackhole.is_blackholed(identity_hash):
+                self._notify_ui("system", f"[bold yellow]Blackholed node-wide:[/] lift it with "
+                                          f"rnpath -U {identity_hash[:16]}.")
+            else:
+                self._notify_ui("system", f"[bold yellow]Not blocked:[/] {escape(needle)}.")
             return False
         self._notify_ui("system", f"[bold green]Unblocked:[/] {identity_hash[:10]}.")
+        self._notify_ui("refresh_chat", None)
         return True
 
     def list_blocked(self):
-        blocked = sorted(blackhole.blackholed_hashes())
-        if not blocked:
-            self._notify_ui("system", "No blackholed identities.")
+        local = set(self.db.blocked_identities())
+        node_wide = blackhole.blackholed_hashes()
+        if not local and not node_wide:
+            self._notify_ui("system", "No blocked identities.")
             return
-        for identity_hash in blocked:
-            handle = self.db.get_profile(identity_hash).get("handle") or "unknown"
-            self._notify_ui("system", f"Blocked: {identity_hash[:10]} ({escape(str(handle))})")
+
+        for identity_hash in sorted(local | node_wide):
+            # The alias survives a block; the profile does not, having been
+            # purged, so identities is the reliable place to name them.
+            record = self.db.get_identity_record(identity_hash) or {}
+            alias = record.get("alias") or "unknown"
+            scope = "node-wide blackhole" if identity_hash in node_wide else "blocked"
+            self._notify_ui("system", f"{scope}: {identity_hash[:10]} ({escape(str(alias))})")
 
     def request_channel(self, name: str, description: str) -> bool:
         if not self._host_link_active():
@@ -739,7 +753,7 @@ class RetiSpeakeasyApp(App):
 
             log_widget.clear()
             history = self.engine.db.get_channel_messages(clean_chan_id, limit=50)
-            blocked = blackhole.blackholed_hashes()
+            blocked = blackhole.blocked_hashes(self.engine.db)
             for msg in history:
                 # Records already stored when the user blocked the author, or
                 # relayed by a hub that does not share the block.

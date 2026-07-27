@@ -184,6 +184,62 @@ def test_blackholed_channel_request_is_refused(hubs):
     assert "spamchan" not in beta.db.get_channel_names()
 
 
+def test_local_block_survives_rns_rewriting_its_blackhole_file(hubs):
+    """
+    Regression: client blocks used to be written into RNS's node-wide blackhole
+    table. That table belongs to the master instance, so a shared-instance
+    client's write was invisible to `rnpath -b` and the next `rnpath -B`
+    overwrote the file and dropped it. Local blocks live in the client's own
+    database instead, and must outlive exactly that.
+    """
+    alpha, beta = hubs
+    spammer = RNS.Identity()
+    for hub in (alpha, beta):
+        hub.db.upsert_identity(spammer.hash.hex(), "spammer", spammer.get_public_key())
+
+    assert beta.db.block_identity(spammer.hash.hex(), reason="Blocked from Speakeasy")
+    # RNS reloading the shared file from the master, wholesale.
+    RNS.Transport.blackholed_identities.clear()
+    RNS.Transport.blackholed_identities[RNS.Identity().hash] = {
+        "source": b"", "until": None, "reason": "someone else",
+    }
+
+    record = alpha.db.sign_and_insert_message(spammer, "parlor", "still spam")
+    beta.deliver(alpha.engine.build_delta_push_chunks([record])[0])
+
+    assert beta.db.is_blocked(spammer.hash.hex())
+    assert not beta.db.has_message(record["msg_id"])
+
+
+def test_local_block_and_rns_blackhole_are_independent(hubs):
+    alpha, beta = hubs
+    locally = RNS.Identity()
+    node_wide = RNS.Identity()
+    beta.db.block_identity(locally.hash.hex())
+    block(node_wide)
+
+    assert blackhole.is_blocked(locally.hash, beta.db)
+    assert blackhole.is_blocked(node_wide.hash, beta.db)
+    # A local block is not, and must not claim to be, a node-wide blackhole.
+    assert not blackhole.is_blackholed(locally.hash)
+    assert blackhole.blocked_hashes(beta.db) == {locally.hash.hex(), node_wide.hash.hex()}
+
+    assert beta.db.unblock_identity(locally.hash.hex())
+    assert not blackhole.is_blocked(locally.hash, beta.db)
+    # Lifting a local block cannot lift an operator's blackhole.
+    assert not beta.db.unblock_identity(node_wide.hash.hex())
+    assert blackhole.is_blocked(node_wide.hash, beta.db)
+
+
+def test_blocking_twice_is_reported_as_already_blocked(hubs):
+    _, beta = hubs
+    spammer = RNS.Identity()
+
+    assert beta.db.block_identity(spammer.hash.hex())
+    assert not beta.db.block_identity(spammer.hash.hex())
+    assert beta.db.blocked_identities() == [spammer.hash.hex()]
+
+
 def test_stored_messages_from_a_blocked_sender_are_not_relayed(hubs):
     """
     A hub that verified and stored a record before the operator blocked its
