@@ -11,9 +11,18 @@ carrying no path of their own.
 
 So Speakeasy consults the same list at the record layer: a blackholed identity's
 messages, profiles, bulletins and channel requests are refused, and its keys are
-neither learned nor gossiped onward. Reusing RNS's list rather than keeping a
-private one means a user blocks someone once, with the standard tooling, and
-every RNS application on that node honours it.
+neither learned nor gossiped onward. Anything the node's operator blackholes with
+the standard tooling is therefore honoured by Speakeasy too.
+
+This module deliberately only *reads* that list. RNS's blackhole table is
+node-wide state owned by the master instance, and every Speakeasy process is
+normally a shared-instance client: writing to it from here changes only the
+calling process's copy -- `rnpath -b` (which reads the master) would not show the
+block -- and the next `rnpath -B` rewrites the shared file wholesale, silently
+dropping whatever Speakeasy wrote. A user blocking someone in their own client is
+also not the same decision as an operator blackholing an identity for the whole
+node, so client blocks are kept in the client's own database (see
+`SpeakeasyDB.block_identity`) and `is_blocked()` honours both.
 """
 import logging
 import time
@@ -64,18 +73,21 @@ def blackholed_hashes() -> Set[str]:
     }
 
 
-def blackhole(identity_hash: Union[str, bytes], reason: str = "",
-              duration_hours: Optional[float] = None) -> bool:
-    """Adds an identity to the node-wide RNS blackhole list."""
+def is_blocked(identity_hash: Union[str, bytes, None], db=None) -> bool:
+    """
+    True when either this node's RNS blackhole list or `db`'s own block list
+    refuses `identity_hash`. Both are consulted per record rather than cached, so
+    a block applied to a running node takes effect on the next frame.
+    """
+    if is_blackholed(identity_hash):
+        return True
     key = _as_bytes(identity_hash)
-    if not key:
-        return False
-    until = time.time() + float(duration_hours) * 3600 if duration_hours else None
-    return bool(RNS.Transport.blackhole_identity(key, until=until, reason=reason or None))
+    return bool(db and key and db.is_blocked(key.hex()))
 
 
-def unblackhole(identity_hash: Union[str, bytes]) -> bool:
-    key = _as_bytes(identity_hash)
-    if not key:
-        return False
-    return bool(RNS.Transport.unblackhole_identity(key))
+def blocked_hashes(db=None) -> Set[str]:
+    """Every hex hash blocked on this node, from both sources."""
+    blocked = blackholed_hashes()
+    if db:
+        blocked |= set(db.blocked_identities())
+    return blocked

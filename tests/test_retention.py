@@ -112,6 +112,41 @@ def test_size_limit_stops_instead_of_deleting_non_message_data(db, caplog):
     assert any("no prunable messages" in record.message for record in caplog.records)
 
 
+def test_size_limit_ignores_pages_freed_by_an_earlier_prune(db):
+    """
+    Regression: a prune earlier in the same sweep leaves its pages on SQLite's
+    freelist, so the file still measures its old size. Reading that made the
+    size stage conclude the prune had achieved nothing and delete the entire
+    remaining history while the real payload was a fraction of the budget.
+    """
+    author = RNS.Identity()
+    for i in range(600):
+        add_message(db, author, "parlor", f"msg-{i:04d}", age_sec=600 - i)
+    inflated = db.db_size_bytes()
+
+    db.prune_channel_overflow(max_per_channel=10)
+
+    # The file has not shrunk yet, but the payload is well inside this budget.
+    assert db.db_size_bytes() >= inflated
+    assert db.db_payload_bytes() < inflated
+    removed = db.enforce_size_limit(inflated // 2)
+
+    assert removed == 0
+    assert len(db.get_messages("parlor", limit=50, since=0)) == 10
+
+
+def test_payload_bytes_tracks_deletions_before_vacuum(db):
+    author = RNS.Identity()
+    for i in range(300):
+        add_message(db, author, "parlor", f"msg-{i}", age_sec=i)
+    before = db.db_payload_bytes()
+
+    db.prune_messages(ttl_days=0.0001)
+
+    assert db.db_payload_bytes() < before
+    assert db.db_size_bytes() >= before  # unchanged on disk until VACUUM
+
+
 def test_size_limit_is_disabled_when_unset(db):
     author = RNS.Identity()
     msg_id = add_message(db, author, "parlor", "keep me")
