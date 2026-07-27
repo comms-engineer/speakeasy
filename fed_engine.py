@@ -440,23 +440,36 @@ class S2SProtocolEngine:
         outbound_frames = result.frames
 
         if opcode == Opcode.FED_HELLO:
-            raw_channels = payload.get(2, [])
+            if isinstance(payload, dict):
+                raw_channels = payload.get(2) if 2 in payload else payload.get("2", [])
+                remote_bucket = payload.get(3) if 3 in payload else payload.get("3")
+            elif isinstance(payload, (list, tuple)) and len(payload) > 3:
+                raw_channels = payload[2]
+                remote_bucket = payload[3]
+            else:
+                raw_channels = []
+                remote_bucket = None
+            
             channels = []
-            for c in raw_channels:
+            for c in raw_channels if isinstance(raw_channels, list) else []:
                 if isinstance(c, dict):
                     name = c.get("name") or c.get("channel")
                     if name:
                         channels.append(str(name))
                 elif isinstance(c, str):
                     channels.append(c)
-
-            remote_bucket = payload.get(3)
-            if remote_bucket and int(remote_bucket) != int(self.db.epoch_bucket_sec):
-                logger.warning(
-                    f"Peer {origin_hash.hex()[:10]} uses epoch_bucket_sec={remote_bucket} but this node "
-                    f"uses {self.db.epoch_bucket_sec}; epoch roots can never agree. Skipping sync."
-                )
-                return result
+            
+            if remote_bucket is not None:
+                try:
+                    bucket_int = int(remote_bucket)
+                    if bucket_int != int(self.db.epoch_bucket_sec):
+                        logger.warning(
+                            f"Peer {origin_hash.hex()[:10]} uses epoch_bucket_sec={remote_bucket} "
+                            f"but this node uses {self.db.epoch_bucket_sec}; epoch roots can never agree. Skipping sync."
+                        )
+                        return result
+                except (ValueError, TypeError):
+                    logger.warning(f"Invalid remote epoch bucket payload received: {remote_bucket}")
 
             result.hello_channels = channels
             sync_frame = self.build_sync_request(channels)
