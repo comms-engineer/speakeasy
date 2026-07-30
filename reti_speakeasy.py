@@ -1369,11 +1369,12 @@ class RetiSpeakeasyApp(App):
             self.engine.db.set_channel_visibility(self.engine.current_host_hash, clean, False)
 
         try:
-            pane = self.query_one(f"#tab-{clean}", TabPane)
-            pane.display = False
             tabs = self.query_one("#channel-tabs", TabbedContent)
+            pane = self.query_one(f"#tab-{clean}", TabPane)
             if tabs.active == f"tab-{clean}":
                 tabs.active = "tab-bbs"
+            # Remove the pane so the tab header disappears immediately.
+            pane.remove()
         except Exception:
             pass
 

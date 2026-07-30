@@ -146,6 +146,43 @@ def test_channel_visibility_hides_host_tab(tmp_path):
     asyncio.run(check_visibility())
 
 
+def test_purge_channel_removes_tab_from_ui(tmp_path):
+    app = RetiSpeakeasyApp()
+    db_path = tmp_path / "client-purge.db"
+    host_hash = "cd" * 16
+
+    def fake_engine_init(self, ui_callback=None):
+        self.ui_callback = ui_callback
+        self.hash_str = "test-hash"
+        self.db = SpeakeasyDB(str(db_path))
+        self.identity = SimpleNamespace(hash=SimpleNamespace(hex=lambda: "test-identity"))
+        self.host_manager = None
+        self.active_host_link = None
+        self.s2s_engine = None
+        self.host_channels = {"general", "tech"}
+        self.current_host_hash = host_hash
+
+    async def check_purge_removes_tab() -> None:
+        with patch("reti_speakeasy.ReticulumEngine.__init__", fake_engine_init), \
+             patch("reti_speakeasy.client_db_path", return_value=str(db_path)):
+            startup_db = SpeakeasyDB(str(db_path))
+            startup_db.add_channel("general", "Channel #general")
+            startup_db.add_channel("tech", "Channel #tech")
+            startup_db.close()
+
+            async with app.run_test() as pilot:
+                app.sync_channel_tabs(["general", "tech"])
+                assert len(list(app.query("#tab-tech"))) == 1
+
+                app._purge_local_channel("tech")
+                await pilot.pause()
+
+                assert len(list(app.query("#tab-tech"))) == 0
+
+    import asyncio
+    asyncio.run(check_purge_removes_tab())
+
+
 def test_calendar_and_event_models_round_trip():
     calendar = Calendar(
         calendar_id="cal-001",
