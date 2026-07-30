@@ -157,6 +157,23 @@ def test_reticulum_engine_emits_diagnostics():
     assert captured[-1] == ("diagnostic", "Path request failed")
 
 
+def test_reticulum_engine_suppresses_path_state_unknown_diagnostics():
+    captured = []
+
+    class FakeUI:
+        def __call__(self, event_type, data):
+            captured.append((event_type, data))
+
+    engine = object.__new__(ReticulumEngine)
+    engine._diagnostics = []
+    engine._stopped = False
+    engine.ui_callback = FakeUI()
+
+    engine._record_transport_diagnostic("Path state unknown for [abc]")
+
+    assert captured == []
+
+
 def test_host_selector_channel_filter_uses_summary():
     hm = HostManager(db=None, probe_interval=300, probes_per_round=1)
     with_tech = {

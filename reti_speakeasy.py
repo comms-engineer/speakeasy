@@ -1068,6 +1068,8 @@ class ReticulumEngine:
         clean_message = str(message).strip()
         if not clean_message:
             return
+        if "path state unknown" in clean_message.lower():
+            return
         self._diagnostics.append(clean_message)
         self._notify_ui("diagnostic", clean_message)
 
