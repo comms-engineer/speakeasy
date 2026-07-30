@@ -8,6 +8,7 @@ import msgpack
 import RNS
 
 import blackhole
+from channel_summary import build_channel_summary
 from fed_engine import (
     DEFAULT_SYNC_HISTORY_DAYS,
     MAX_MESSAGE_CONTENT_BYTES,
@@ -116,6 +117,9 @@ class SpeakeasyDaemon:
             mod_cfg.get("receive_federated_channel_nominations", True)
         )
         self.auto_discover_peers = bool(fed_cfg.get("auto_discover_peers", True))
+        self.include_channel_summary_in_announces = bool(
+            fed_cfg.get("include_channel_summary_in_announces", True)
+        )
 
         # 1. Initialize DB & Reticulum Stack
         os.makedirs(STATE_DIR, exist_ok=True)
@@ -211,6 +215,11 @@ class SpeakeasyDaemon:
             "max_load": self.max_clients,
             "flags": 0b00000011  # Supports Bulletin + DM Buffer
         }
+        if self.include_channel_summary_in_announces:
+            active_channels = self.db.get_active_channel_names()
+            payload["chc"] = len(active_channels)
+            payload["chs"] = build_channel_summary(active_channels)
+            payload["chv"] = 1
         return msgpack.packb(payload, use_bin_type=True)
 
     def announce_host(self):

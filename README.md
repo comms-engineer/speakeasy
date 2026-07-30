@@ -82,6 +82,11 @@ the same Reticulum network — `static_peers` is a fallback, not a requirement. 
 the hub itself are ignored, discovered peers are linked at most once, and discovery stops at
 `node.max_clients`.
 
+For client-side host filtering, announces can optionally include a tiny fixed-size channel
+summary (plus channel count) so the client can pre-filter likely hubs by channel before
+connecting. This is a probabilistic prefilter, not an authority source: exact channel lists
+still come from `FED_HELLO` after link establishment.
+
 ### Channels
 
 Channels are not purely local configuration. A client can request one (`n` in the TUI),
@@ -231,6 +236,7 @@ instead of storing a message nobody will ever receive.
 | `federation.epoch_bucket_sec` | Anti-entropy epoch width; must match peers |
 | `federation.settlement_delay_ms` | Pause before initiating a peer link |
 | `federation.auto_discover_peers` | Federate with any hub heard announcing, not just `static_peers` |
+| `federation.include_channel_summary_in_announces` | Includes a compact channel summary in announces for low-overhead client host prefiltering |
 | `channels.allowed_channels` | Channels this hub hosts; operator-approved channels are accepted on top of this |
 | `moderation.accept_channel_requests` | Whether clients may queue channel requests |
 | `moderation.receive_federated_channel_nominations` | Whether this hub accepts channel nominations relayed from federated peers |

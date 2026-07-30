@@ -8,6 +8,7 @@ import msgpack
 import RNS
 
 from typing import Optional
+from channel_summary import channel_maybe_present
 from rich.markup import escape
 from textual.app import App, ComposeResult
 from textual.containers import Horizontal, Vertical
@@ -490,6 +491,13 @@ class HostSelectorModal(ModalScreen[str]):
         height: 7;
         margin-bottom: 1;
     }
+    #channel-filter {
+        margin-bottom: 1;
+    }
+    #filter-hint {
+        color: $text-muted;
+        margin-bottom: 1;
+    }
     #manual-input {
         margin-bottom: 1;
     }
@@ -505,11 +513,15 @@ class HostSelectorModal(ModalScreen[str]):
     def __init__(self, host_manager: HostManager):
         super().__init__()
         self.host_manager = host_manager
+        self.channel_filter = ""
 
     def compose(self) -> ComposeResult:
         with Vertical(id="dialog"):
             yield Label(" Select Host Entrypoint", id="modal-title")
             yield DataTable(id="hosts-table")
+            yield Input(placeholder="Filter hubs by channel (likely match)", id="channel-filter")
+            yield Label(" Channel filter uses announce summaries (likely match). Exact channels are verified after connect.",
+                        id="filter-hint")
             yield Input(placeholder="Or enter manual 32-char hex hash...", id="manual-input")
             with Horizontal(id="button-row"):
                 yield Button("Connect Selected", variant="success", id="btn-connect-sel")
@@ -522,8 +534,28 @@ class HostSelectorModal(ModalScreen[str]):
     def on_mount(self) -> None:
         table = self.query_one("#hosts-table", DataTable)
         table.cursor_type = "row"
-        table.add_columns("Alias / Hash", "Hops", "Load", "Type", "Score", "Age", "Reachable")
+        table.add_columns("Alias / Hash", "Hops", "Load", "Type", "Score", "Age", "Reachable", "Channels")
         self.refresh_table()
+
+    def _extract_channel_summary(self, host: dict) -> bytes | None:
+        metadata = host.get("metadata") or {}
+        summary = metadata.get("chs")
+        if isinstance(summary, (bytes, bytearray)):
+            return bytes(summary)
+        if isinstance(summary, str):
+            try:
+                return bytes.fromhex(summary)
+            except ValueError:
+                return None
+        return None
+
+    def _host_matches_channel_filter(self, host: dict) -> bool:
+        if not self.channel_filter:
+            return True
+        summary = self._extract_channel_summary(host)
+        if not summary:
+            return False
+        return channel_maybe_present(self.channel_filter, summary)
 
     def refresh_table(self) -> None:
         table = self.query_one("#hosts-table", DataTable)
@@ -531,17 +563,38 @@ class HostSelectorModal(ModalScreen[str]):
         ranked = self.host_manager.get_ranked_hosts()
         now = time.time()
         for h in ranked:
+            if not self._host_matches_channel_filter(h):
+                continue
             h_type = "Manual" if h.get("is_manual") else "Discovered"
             load_str = f"{h.get('load')}/{h.get('max_load')}" if not h.get("is_manual") else "N/A"
             age_str = human_age(now - float(h.get("last_seen", 0)))
+            metadata = h.get("metadata") or {}
+            channel_count = metadata.get("chc")
+            channel_count_str = str(channel_count) if isinstance(channel_count, int) else "?"
             try:
                 reachable = "Yes" if (RNS.Transport.hops_to(h.get("hash_bytes")) is not None or RNS.Transport.has_path(h.get("hash_bytes"))) else "No"
             except Exception:
                 reachable = "?"
-            table.add_row(h.get("alias"), str(h.get("hops")), load_str, h_type, str(h.get("score")), age_str, reachable, key=h.get("hex_hash"))
+            table.add_row(
+                h.get("alias"),
+                str(h.get("hops")),
+                load_str,
+                h_type,
+                str(h.get("score")),
+                age_str,
+                reachable,
+                channel_count_str,
+                key=h.get("hex_hash"),
+            )
 
     def on_input_submitted(self, event: Input.Submitted) -> None:
         event.stop()
+        if event.input.id == "channel-filter":
+            self.channel_filter = event.value.strip().lstrip("#").lower()
+            self.refresh_table()
+            return
+        if event.input.id != "manual-input":
+            return
         val = event.value.strip()
         if val:
             self.host_manager.add_manual_host(val)

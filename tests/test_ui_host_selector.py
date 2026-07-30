@@ -1,4 +1,5 @@
 from types import SimpleNamespace
+from channel_summary import build_channel_summary
 from reti_speakeasy import HostSelectorModal, HostManager
 
 
@@ -76,3 +77,23 @@ def test_host_selector_populates_table(monkeypatch):
     assert "Alias / Hash" in fake_table.columns
     # Should have added two rows (one per host)
     assert fake_table.row_count == 2
+
+
+def test_host_selector_channel_filter_uses_summary():
+    hm = HostManager(db=None, probe_interval=300, probes_per_round=1)
+    with_tech = {
+        "hex_hash": "11" * 16,
+        "alias": "TechHub",
+        "metadata": {"chs": build_channel_summary(["general", "tech"]), "chc": 2},
+    }
+    without_tech = {
+        "hex_hash": "22" * 16,
+        "alias": "QuietHub",
+        "metadata": {"chs": build_channel_summary(["general"]), "chc": 1},
+    }
+
+    modal = HostSelectorModal(hm)
+    modal.channel_filter = "tech"
+
+    assert modal._host_matches_channel_filter(with_tech)
+    assert not modal._host_matches_channel_filter(without_tech)

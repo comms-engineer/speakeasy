@@ -9,6 +9,7 @@
   "static_peers": [],
   "federation": {
     "auto_discover_peers": true,
+    "include_channel_summary_in_announces": true,
     "epoch_bucket_sec": 300,
     "max_sync_history_days": 14,
     "settlement_delay_ms": 350
