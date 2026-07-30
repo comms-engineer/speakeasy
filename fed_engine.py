@@ -59,6 +59,8 @@ class Opcode(enum.IntEnum):
     IDENTITY_PUSH = 0x09
     IDENTITY_REQ = 0x0A
     CHANNEL_REQ = 0x0B
+    CHANNEL_POLL_REQ = 0x0C
+    CHANNEL_POLL_RESP = 0x0D
 
 
 @dataclass
@@ -225,6 +227,9 @@ class S2SProtocolEngine:
         if requester_hash:
             payload[2] = bytes.fromhex(requester_hash)
         return WireCodec.pack(Opcode.CHANNEL_REQ, self.local_hash_bytes, payload)
+
+    def build_channel_poll_req(self, channel_name: str) -> bytes:
+        return WireCodec.pack(Opcode.CHANNEL_POLL_REQ, self.local_hash_bytes, {0: channel_name})
 
     def build_hello(self, active_channels: list[str]) -> bytes:
         payload = {
@@ -546,6 +551,18 @@ class S2SProtocolEngine:
                     "description": desc,
                     "requester_hash": requester_hash,
                 })
+
+        elif opcode == Opcode.CHANNEL_POLL_REQ:
+            if self._refuse_blackholed(origin_hash.hex(), f"channel poll for #{payload.get(0, '')}"):
+                return result
+            chan_name = str(payload.get(0) or payload.get("0") or "")
+            record = self.db.get_channel(chan_name) if chan_name else None
+            present = bool(record and str(record.get("status") or "active").lower() == "active")
+            outbound_frames.append(WireCodec.pack(
+                Opcode.CHANNEL_POLL_RESP,
+                self.local_hash_bytes,
+                {0: chan_name, 1: present},
+            ))
 
         elif opcode == Opcode.IDENTITY_PUSH:
             if self._refuse_blackholed(payload[0].hex(), "identity push"):

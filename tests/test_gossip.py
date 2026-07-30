@@ -237,6 +237,28 @@ def test_duplicate_channel_requests_do_not_stack(hub, bob):
     assert len(hub.db.get_channel_requests("pending")) == 1
 
 
+def test_channel_poll_request_reports_local_channel_presence(hub, bob):
+    hub.db.sign_and_add_channel(hub.identity, "lounge", "off-topic chatter")
+
+    result = hub.deliver(bob.engine.build_channel_poll_req("lounge"))
+
+    assert len(result.frames) == 1
+    opcode, _, _, payload = WireCodec.unpack(result.frames[0])
+    assert opcode == Opcode.CHANNEL_POLL_RESP
+    assert payload[0] == "lounge"
+    assert payload[1] is True
+
+
+def test_channel_poll_request_reports_absence_for_unknown_channel(hub, bob):
+    result = hub.deliver(bob.engine.build_channel_poll_req("missing"))
+
+    assert len(result.frames) == 1
+    opcode, _, _, payload = WireCodec.unpack(result.frames[0])
+    assert opcode == Opcode.CHANNEL_POLL_RESP
+    assert payload[0] == "missing"
+    assert payload[1] is False
+
+
 def test_approved_channel_propagates_and_is_verifiable(hub, bob):
     hub.deliver(bob.engine.build_channel_req("lounge", "off-topic chatter"))
     record = hub.db.sign_and_add_channel(hub.identity, "lounge", "off-topic chatter")
