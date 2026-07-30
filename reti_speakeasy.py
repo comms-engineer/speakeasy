@@ -48,8 +48,44 @@ def calculate_host_score(hops: int, load: int, max_load: int, last_seen: float) 
     return round(hop_score * capacity_score * decay, 2)
 
 class HostManager:
-    def __init__(self):
+    def __init__(self, db: SpeakeasyDB | None = None):
         self.hosts = {}
+        self.db = db
+        self._load_from_db()
+
+    def _load_from_db(self) -> None:
+        if not self.db:
+            return
+        for host in self.db.get_known_hosts():
+            hex_hash = host.get("hex_hash")
+            if not hex_hash:
+                continue
+            self.hosts[hex_hash] = {
+                "hash_bytes": bytes.fromhex(hex_hash),
+                "hex_hash": hex_hash,
+                "identity": None,
+                "alias": host.get("alias") or f"Host-{hex_hash[:6]}",
+                "hops": int(host.get("hops", 99)),
+                "load": int(host.get("load", 0)),
+                "max_load": int(host.get("max_load", 10)),
+                "last_seen": float(host.get("last_seen", time.time())),
+                "is_manual": bool(host.get("is_manual", False)),
+                "score": float(host.get("score", 0.0)),
+            }
+
+    def _persist_host(self, host: dict) -> None:
+        if not self.db:
+            return
+        self.db.upsert_known_host({
+            "hex_hash": host["hex_hash"],
+            "alias": host.get("alias", f"Host-{host['hex_hash'][:6]}"),
+            "hops": host.get("hops", 99),
+            "load": host.get("load", 0),
+            "max_load": host.get("max_load", 10),
+            "last_seen": host.get("last_seen", time.time()),
+            "is_manual": host.get("is_manual", False),
+            "score": host.get("score", 0.0),
+        })
 
     def update_from_announce(self, destination_hash: bytes, announced_identity: RNS.Identity, app_data: bytes):
         hex_hash = destination_hash.hex()
@@ -74,6 +110,7 @@ class HostManager:
             "is_manual": False,
             "score": 0.0
         }
+        self._persist_host(self.hosts[hex_hash])
 
     def add_manual_host(self, hex_hash_str: str) -> bool:
         clean_hex = hex_hash_str.replace("<", "").replace(">", "").replace(" ", "").replace(":", "")
@@ -100,6 +137,7 @@ class HostManager:
             "is_manual": True,
             "score": 0.0
         }
+        self._persist_host(self.hosts[clean_hex])
         return True
 
     def get_ranked_hosts(self) -> list:
@@ -107,7 +145,7 @@ class HostManager:
         ranked = []
         for hex_hash, host in list(self.hosts.items()):
             if not host["is_manual"] and (now - host["last_seen"] > 7200):
-                del self.hosts[hex_hash]
+                self.hosts.pop(hex_hash, None)
                 continue
 
             host["score"] = calculate_host_score(
@@ -192,7 +230,7 @@ class HostSelectorModal(ModalScreen[str]):
     def on_mount(self) -> None:
         table = self.query_one("#hosts-table", DataTable)
         table.cursor_type = "row"
-        table.add_columns("Alias / Hash", "Hops", "Load", "Type", "Score")
+        table.add_columns("Alias / Hash", "Hops", "Load", "Type", "Score", "Age")
         self.refresh_table()
 
     def refresh_table(self) -> None:
@@ -202,7 +240,9 @@ class HostSelectorModal(ModalScreen[str]):
         for h in ranked:
             h_type = "Manual" if h["is_manual"] else "Discovered"
             load_str = f"{h['load']}/{h['max_load']}" if not h["is_manual"] else "N/A"
-            table.add_row(h["alias"], str(h["hops"]), load_str, h_type, str(h["score"]), key=h["hex_hash"])
+            age_seconds = max(0, int(time.time() - h["last_seen"]))
+            age_str = f"{age_seconds}s"
+            table.add_row(h["alias"], str(h["hops"]), load_str, h_type, str(h["score"]), age_str, key=h["hex_hash"])
 
     def on_input_submitted(self, event: Input.Submitted) -> None:
         event.stop()
@@ -489,7 +529,7 @@ class ReticulumEngine:
         )
         self.hash_str = RNS.prettyhexrep(self.destination.hash)
 
-        self.host_manager = HostManager()
+        self.host_manager = HostManager(self.db)
         self.discovery_handler = SpeakeasyHostDiscoveryHandler(self.host_manager)
         RNS.Transport.register_announce_handler(self.discovery_handler)
 

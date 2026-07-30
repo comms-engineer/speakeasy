@@ -1,5 +1,4 @@
-<<<<<<< HEAD
-﻿"""Database helpers for Speakeasy.
+"""Database helpers for Speakeasy.
 
 This module provides lightweight SQLite-backed calendar support for Phase 1.
 The design intentionally includes ownership, channel scoping, and change-log
@@ -613,7 +612,6 @@ __all__ = [
     "create_calendar_tables",
     "SpeakeasyDB",
 ]
-=======
 import sqlite3
 import threading
 import time
@@ -805,6 +803,19 @@ class SpeakeasyDB:
                 )
             """)
 
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS known_hosts (
+                    hex_hash TEXT PRIMARY KEY,
+                    alias TEXT,
+                    hops INTEGER,
+                    load INTEGER,
+                    max_load INTEGER,
+                    last_seen REAL,
+                    is_manual INTEGER,
+                    score REAL
+                )
+            """)
+
             # Epoch sync scans messages by (channel, timestamp) range on every
             # anti-entropy round; the bulletin index backs the board view.
             cursor.execute("CREATE INDEX IF NOT EXISTS idx_messages_channel_ts ON messages (channel, timestamp)")
@@ -867,6 +878,39 @@ class SpeakeasyDB:
                 LIMIT ?
             """, (limit,))
             return [row[0] for row in cursor.fetchall()]
+
+    def upsert_known_host(self, host: Dict[str, Any]) -> bool:
+        hex_hash = host.get("hex_hash")
+        if not hex_hash:
+            return False
+        if isinstance(hex_hash, bytes):
+            hex_hash = hex_hash.hex()
+        alias = host.get("alias") or f"Host-{str(hex_hash)[:6]}"
+        hops = int(host.get("hops", 99))
+        load = int(host.get("load", 0))
+        max_load = int(host.get("max_load", 10))
+        last_seen = float(host.get("last_seen", time.time()))
+        is_manual = int(bool(host.get("is_manual", False)))
+        score = float(host.get("score", 0.0))
+        with self._tx() as cursor:
+            cursor.execute("""
+                INSERT INTO known_hosts (hex_hash, alias, hops, load, max_load, last_seen, is_manual, score)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(hex_hash) DO UPDATE SET
+                    alias = excluded.alias,
+                    hops = excluded.hops,
+                    load = excluded.load,
+                    max_load = excluded.max_load,
+                    last_seen = excluded.last_seen,
+                    is_manual = excluded.is_manual,
+                    score = excluded.score
+            """, (str(hex_hash), alias, hops, load, max_load, last_seen, is_manual, score))
+        return True
+
+    def get_known_hosts(self) -> List[Dict[str, Any]]:
+        with self._tx() as cursor:
+            cursor.execute("SELECT * FROM known_hosts ORDER BY score DESC, last_seen DESC")
+            return [dict(row) for row in cursor.fetchall()]
 
     def resolve_identity(self, needle: str) -> Optional[str]:
         """
@@ -1556,4 +1600,3 @@ class SpeakeasyDB:
         with self._tx() as cursor:
             cursor.execute(query, (channel_id, limit))
             return [dict(row) for row in cursor.fetchall()]
->>>>>>> parent of ed5fac4 (feat(client): persist known hosts, show advertisement age, and background probe by score)
