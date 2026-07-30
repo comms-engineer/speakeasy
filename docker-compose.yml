@@ -9,7 +9,7 @@ services:
       - "4242:4242/udp"
     volumes:
       - ./data:/root/.reti_speakeasy
-      - ./reticulum_conf:/root/.reticulum
+      - ./reticulum_conf:/etc/reticulum
       - ./speakeasy_config.json:/app/speakeasy_config.json:ro
     environment:
       - TZ=UTC

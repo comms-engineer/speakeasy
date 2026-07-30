@@ -252,6 +252,12 @@ Or with Docker (state, including the database and identity, persists in `./data`
 docker compose up --build
 ```
 
+The sample compose file mounts `./reticulum_conf` to `/etc/reticulum` inside the
+container. That directory should contain a Speakeasy-specific Reticulum client
+configuration, not the full config of a transport node you are trying to attach to.
+If Speakeasy should connect to an existing shared Reticulum instance over TCP, put
+that client-only shared-instance config in `./reticulum_conf/config`.
+
 ## Running the client
 
 ```bash

@@ -25,6 +25,26 @@ ASPECT_HOST = "host"
 STATE_DIR = os.path.expanduser("~/.reti_speakeasy")
 
 
+def _env_flag(name: str, default: bool = False) -> bool:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    return str(raw).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _reticulum_config_dir() -> str | None:
+    override = os.environ.get("SPEAKEASY_RNS_CONFIG_DIR") or os.environ.get("RNS_CONFIG_DIR")
+    if override:
+        return os.path.expanduser(override)
+    return None
+
+
+def _initialise_reticulum(require_shared_default: bool = False) -> RNS.Reticulum:
+    configdir = _reticulum_config_dir()
+    require_shared = _env_flag("SPEAKEASY_REQUIRE_SHARED_INSTANCE", default=require_shared_default)
+    return RNS.Reticulum(configdir=configdir, require_shared_instance=require_shared)
+
+
 def instance_name() -> str:
     return sys.argv[1] if len(sys.argv) > 1 else "client_default"
 
@@ -861,7 +881,7 @@ class ReticulumEngine:
         self.host_channels = set()
 
         self.db = SpeakeasyDB(client_db_path(), max_message_bytes=MAX_MESSAGE_CONTENT_BYTES)
-        self.rns = RNS.Reticulum()
+        self.rns = _initialise_reticulum()
 
         identity_path = os.path.join(STATE_DIR, f"{instance_name()}_identity")
         if os.path.exists(identity_path):

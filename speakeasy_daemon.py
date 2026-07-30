@@ -31,6 +31,41 @@ STATE_DIR = os.path.expanduser("~/.reti_speakeasy")
 logger = logging.getLogger("speakeasy_daemon")
 
 
+def _env_flag(name: str, default: bool = False) -> bool:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    return str(raw).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _reticulum_config_dir() -> str | None:
+    override = os.environ.get("SPEAKEASY_RNS_CONFIG_DIR") or os.environ.get("RNS_CONFIG_DIR")
+    if override:
+        return os.path.expanduser(override)
+    return None
+
+
+def _initialise_reticulum(component: str, require_shared_default: bool = False) -> RNS.Reticulum:
+    configdir = _reticulum_config_dir()
+    require_shared = _env_flag("SPEAKEASY_REQUIRE_SHARED_INSTANCE", default=require_shared_default)
+    rns = RNS.Reticulum(configdir=configdir, require_shared_instance=require_shared)
+
+    if rns.is_connected_to_shared_instance:
+        logger.info("%s connected to shared Reticulum instance%s",
+                    component,
+                    f" via {configdir}" if configdir else "")
+    elif rns.is_shared_instance:
+        logger.info("%s started a shared Reticulum instance%s",
+                    component,
+                    f" via {configdir}" if configdir else "")
+    else:
+        logger.warning("%s is running with a standalone Reticulum instance%s",
+                       component,
+                       f" via {configdir}" if configdir else "")
+
+    return rns
+
+
 def configure_logging(log_cfg: dict):
     level = getattr(logging, str(log_cfg.get("level", "INFO")).upper(), logging.INFO)
     handlers = [logging.StreamHandler(sys.stdout)]
@@ -148,7 +183,7 @@ class SpeakeasyDaemon:
             if str(c.get("status") or "active").lower() == "blocked"
         )
 
-        self.rns = RNS.Reticulum()
+        self.rns = _initialise_reticulum("Speakeasy daemon")
 
         # 2. Identity Management
         identity_path = os.path.join(STATE_DIR, f"{self.node_name}_identity")
