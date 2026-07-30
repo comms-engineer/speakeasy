@@ -1,6 +1,5 @@
 import time
-import threading
-from types import SimpleNamespace
+
 from speakeasy_db import SpeakeasyDB
 from reti_speakeasy import HostManager
 

@@ -7,11 +7,19 @@ support so event edits and deletions can flow across federated nodes.
 
 from __future__ import annotations
 
+import hashlib
 import json
+import logging
 import sqlite3
+import threading
 import time
+from contextlib import contextmanager
 from dataclasses import dataclass
-from typing import Any, List, Optional, Tuple
+from enum import Enum
+from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
+
+import RNS
+import signing
 
 
 @dataclass(frozen=True)
@@ -351,8 +359,8 @@ def create_calendar_tables(connection: sqlite3.Connection) -> None:
     connection.commit()
 
 
-class SpeakeasyDB:
-    """Lightweight SQLite wrapper for calendar persistence and sync."""
+class CalendarStore:
+    """Shared calendar persistence helpers for SQLite-backed stores."""
 
     def __init__(self, db_path: str, *args: Any, **kwargs: Any) -> None:
         self.db_path = db_path
@@ -363,7 +371,7 @@ class SpeakeasyDB:
     def close(self) -> None:
         self.connection.close()
 
-    def __enter__(self) -> "SpeakeasyDB":
+    def __enter__(self) -> "CalendarStore":
         return self
 
     def __exit__(self, exc_type: Any, exc: Any, tb: Any) -> None:
@@ -607,21 +615,12 @@ class SpeakeasyDB:
 
 __all__ = [
     "Calendar",
+    "CalendarStore",
     "Event",
     "EventChange",
     "create_calendar_tables",
     "SpeakeasyDB",
 ]
-import sqlite3
-import threading
-import time
-import hashlib
-import logging
-from contextlib import contextmanager
-from enum import Enum
-from typing import Optional, Dict, List, Any, Iterable, Set
-import RNS
-import signing
 
 logger = logging.getLogger("speakeasy_db")
 
@@ -668,7 +667,7 @@ def merkle_root(leaf_ids: Iterable[str]) -> str:
         ]
     return level[0].hex()
 
-class SpeakeasyDB:
+class SpeakeasyDB(CalendarStore):
     def __init__(self, db_path: str = "speakeasy.db",
                  epoch_bucket_sec: int = DEFAULT_EPOCH_BUCKET_SEC,
                  max_message_bytes: int = 0):
@@ -677,6 +676,7 @@ class SpeakeasyDB:
         self.max_message_bytes = int(max_message_bytes)
         self._lock = threading.RLock()
         self._conn = sqlite3.connect(db_path, check_same_thread=False, timeout=10.0)
+        self.connection = self._conn
         self._conn.row_factory = sqlite3.Row
         self._conn.execute("PRAGMA journal_mode=WAL")
         self._conn.execute("PRAGMA busy_timeout=10000")
@@ -910,6 +910,16 @@ class SpeakeasyDB:
     def save_host(self, host: Dict[str, Any]) -> bool:
         return self.upsert_known_host(host)
 
+    def get_host(self, hex_hash: str) -> Optional[Dict[str, Any]]:
+        with self._tx() as cursor:
+            cursor.execute("SELECT * FROM known_hosts WHERE hex_hash = ?", (str(hex_hash),))
+            row = cursor.fetchone()
+            if not row:
+                return None
+            entry = dict(row)
+            entry["is_manual"] = bool(entry.get("is_manual", 0))
+            return entry
+
     def load_hosts(self, limit: int = 100) -> List[Dict[str, Any]]:
         with self._tx() as cursor:
             cursor.execute("SELECT * FROM known_hosts ORDER BY score DESC, last_seen DESC LIMIT ?", (int(limit),))
@@ -920,6 +930,15 @@ class SpeakeasyDB:
                 entry["is_manual"] = bool(entry.get("is_manual", 0))
                 rows.append(entry)
             return rows
+
+    def delete_stale_hosts(self, older_than_seconds: float = 7200) -> int:
+        cutoff = time.time() - float(older_than_seconds)
+        with self._tx() as cursor:
+            cursor.execute(
+                "DELETE FROM known_hosts WHERE is_manual = 0 AND last_seen < ?",
+                (cutoff,),
+            )
+            return cursor.rowcount
 
     def get_known_hosts(self) -> List[Dict[str, Any]]:
         return self.load_hosts(limit=500)

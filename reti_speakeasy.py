@@ -234,12 +234,10 @@ class HostManager:
     def get_ranked_hosts(self) -> list:
         now = time.time()
         ranked = []
-        for hex_hash, host in list(self.hosts.items()):
-            if not host.get("is_manual") and (now - host.get("last_seen", 0) > 7200):
-                # keep DB entry but drop from in-memory catalog to avoid noise
-                del self.hosts[hex_hash]
-                continue
-
+        for host in list(self.hosts.values()):
+            # Keep previously discovered hosts visible to the UI and the caller.
+            # Stale-host cleanup is handled by the DB layer separately so this
+            # list remains useful for manual inspection and selection.
             host["score"] = calculate_host_score(
                 host.get("hops", 99),
                 host.get("load", 0),
@@ -263,6 +261,62 @@ class SpeakeasyHostDiscoveryHandler:
 # -----------------------------------------------------------------------------
 # Modals
 # -----------------------------------------------------------------------------
+
+class ChannelRequestModal(ModalScreen[dict]):
+    BINDINGS = [("escape", "dismiss_modal", "Cancel / Close")]
+
+    def __init__(self):
+        super().__init__()
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="dialog"):
+            yield Label(" Request Channel", id="modal-title")
+            yield Input(placeholder="Channel name", id="input-name")
+            yield Input(placeholder="Description", id="input-description")
+            with Horizontal(id="button-row"):
+                yield Button("Send Request", variant="success", id="btn-submit")
+                yield Button("Cancel [Esc]", variant="error", id="btn-cancel")
+
+    def action_dismiss_modal(self) -> None:
+        self.dismiss(None)
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        if event.button.id == "btn-submit":
+            self.dismiss({
+                "name": self.query_one("#input-name", Input).value.strip(),
+                "description": self.query_one("#input-description", Input).value.strip(),
+            })
+        else:
+            self.dismiss(None)
+
+
+class BulletinPostModal(ModalScreen[dict]):
+    BINDINGS = [("escape", "dismiss_modal", "Cancel / Close")]
+
+    def __init__(self):
+        super().__init__()
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="dialog"):
+            yield Label(" Post Bulletin", id="modal-title")
+            yield Input(placeholder="Title", id="input-title")
+            yield TextArea(placeholder="Body", id="input-body")
+            with Horizontal(id="button-row"):
+                yield Button("Post", variant="success", id="btn-submit")
+                yield Button("Cancel [Esc]", variant="error", id="btn-cancel")
+
+    def action_dismiss_modal(self) -> None:
+        self.dismiss(None)
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        if event.button.id == "btn-submit":
+            self.dismiss({
+                "title": self.query_one("#input-title", Input).value.strip(),
+                "body": self.query_one("#input-body", TextArea).text.strip(),
+            })
+        else:
+            self.dismiss(None)
+
 
 class HostSelectorModal(ModalScreen[str]):
     BINDINGS = [
