@@ -441,6 +441,7 @@ class SpeakeasyDaemon:
 
         if self.operator.notify("Speakeasy online", body):
             self.operator_bootstrap_pending = False
+            self._log_operator_action("operator_heartbeat_sent", target="startup")
             logger.info("Sent startup heartbeat to operator over LXMF.")
             return
 
@@ -464,6 +465,7 @@ class SpeakeasyDaemon:
             "status\n"
             "pending (alias: requests)\n"
             "channels\n"
+            "recent [N] (alias: audit)\n"
             "approve <channel>\n"
             "deny <channel>\n"
             "add <channel> [description]\n"
@@ -471,6 +473,35 @@ class SpeakeasyDaemon:
             "resume <channel>\n"
             "block <channel>"
         )
+
+    def _log_operator_action(self, action: str, target: str = "", detail: str = ""):
+        try:
+            self.db.log_operator_action(action=action, target=target, detail=detail)
+        except Exception:
+            # Operator tooling should keep working even if audit storage fails.
+            logger.debug("Could not persist operator action audit record.", exc_info=True)
+
+    def _operator_recent_text(self, argument: str = "") -> str:
+        limit = 10
+        if argument:
+            try:
+                limit = max(1, min(int(argument.strip()), 50))
+            except ValueError:
+                return "Usage: recent [N]"
+
+        rows = self.db.get_recent_operator_actions(limit=limit)
+        if not rows:
+            return "No operator actions recorded yet."
+
+        lines = ["Recent operator actions:"]
+        for row in rows:
+            ts = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(float(row.get("timestamp") or 0)))
+            action = str(row.get("action") or "unknown")
+            target = str(row.get("target") or "-")
+            detail = str(row.get("detail") or "")
+            suffix = f" ({detail})" if detail else ""
+            lines.append(f"{ts} | {action} | {target}{suffix}")
+        return "\n".join(lines)
 
     def _operator_status_text(self) -> str:
         uptime_sec = int(max(0, time.time() - self.started_at))
@@ -510,6 +541,8 @@ class SpeakeasyDaemon:
         self._rebuild_channel_policy()
 
         peers = self._broadcast(self.s2s_engine.build_channel_frames([name]))
+        self._log_operator_action("approve_channel", target=name,
+                      detail=f"propagated_to={peers}")
         logger.info(f"Approved channel #{name}; propagated to {peers} peer link(s).")
         return f"Approved #{name} and propagated it to {peers} connected peer(s)."
 
@@ -526,6 +559,8 @@ class SpeakeasyDaemon:
         self.channel_blocklist.discard(clean)
         self._rebuild_channel_policy()
         peers = self._broadcast(self.s2s_engine.build_channel_frames([clean]))
+        self._log_operator_action("add_channel", target=clean,
+                      detail=f"propagated_to={peers}")
         return f"Added #{clean} and propagated it to {peers} connected peer(s)."
 
     def pause_channel(self, name: str) -> str:
@@ -533,6 +568,7 @@ class SpeakeasyDaemon:
         if not self.db.set_channel_status(clean, "paused"):
             return f"Unknown channel #{clean}."
         self._rebuild_channel_policy()
+        self._log_operator_action("pause_channel", target=clean)
         return f"Paused #{clean}; traffic is now refused."
 
     def resume_channel(self, name: str) -> str:
@@ -543,6 +579,7 @@ class SpeakeasyDaemon:
         self._rebuild_channel_policy()
         if self.db.get_channel(clean).get("signature"):
             self._broadcast(self.s2s_engine.build_channel_frames([clean]))
+        self._log_operator_action("resume_channel", target=clean)
         return f"Resumed #{clean}."
 
     def block_channel(self, name: str) -> str:
@@ -551,10 +588,12 @@ class SpeakeasyDaemon:
             return f"Unknown channel #{clean}."
         self.channel_blocklist.add(clean)
         self._rebuild_channel_policy()
+        self._log_operator_action("block_channel", target=clean)
         return f"Blocked #{clean}; requests and traffic are refused."
 
     def deny_channel(self, name: str) -> str:
         if self.db.set_channel_request_status(name, "denied"):
+            self._log_operator_action("deny_channel", target=name)
             logger.info(f"Denied channel request #{name}.")
             return f"Denied #{name}."
         return f"No pending request for #{name}."
@@ -564,6 +603,8 @@ class SpeakeasyDaemon:
             return self._operator_help_text()
         if command in {"status", "stats"}:
             return self._operator_status_text()
+        if command in {"recent", "audit"}:
+            return self._operator_recent_text(argument)
         if command == "approve" and argument:
             return self.approve_channel(argument.lstrip("#"))
         if command == "deny" and argument:

@@ -11,6 +11,7 @@ class _FakeDB:
             {"name": "tech", "status": "blocked"},
             {"name": "ops", "status": "paused"},
         ]
+        self._operator_actions = []
 
     def get_active_channel_names(self):
         return [c["name"] for c in self._channels if c["status"] == "active"]
@@ -21,6 +22,20 @@ class _FakeDB:
     def get_channel_requests(self, status):
         assert status == "pending"
         return [{"name": "lounge", "description": "chat"}]
+
+    def log_operator_action(self, action, target="", detail=""):
+        self._operator_actions.append(
+            {
+                "timestamp": time.time(),
+                "action": str(action),
+                "target": str(target),
+                "detail": str(detail),
+            }
+        )
+        return True
+
+    def get_recent_operator_actions(self, limit=10):
+        return list(reversed(self._operator_actions))[: int(limit)]
 
 
 class _FakeOperator:
@@ -92,3 +107,23 @@ def test_operator_requests_alias_matches_pending(monkeypatch):
 
     assert pending == requests
     assert "#lounge" in pending
+
+
+def test_operator_recent_command_shows_audit_entries():
+    daemon = _make_daemon_for_unit_tests(notify_result=True)
+    daemon.db.log_operator_action("approve_channel", target="lounge", detail="propagated_to=2")
+    daemon.db.log_operator_action("pause_channel", target="off-topic")
+
+    result = daemon.handle_operator_command("recent", "5")
+
+    assert "Recent operator actions:" in result
+    assert "approve_channel" in result
+    assert "pause_channel" in result
+
+
+def test_operator_recent_command_validates_count():
+    daemon = _make_daemon_for_unit_tests(notify_result=True)
+
+    result = daemon.handle_operator_command("recent", "many")
+
+    assert result == "Usage: recent [N]"

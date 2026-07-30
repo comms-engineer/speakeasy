@@ -137,6 +137,7 @@ Send one command per line in the LXMF thread; multiple lines are processed in or
 | `help` or `?` | Show full command help |
 | `status` or `stats` | Node status (uptime, links, channel state counts, pending requests) |
 | `pending` or `requests` | List pending channel nominations |
+| `recent [N]` or `audit [N]` | Show most recent operator actions (default 10, max 50) |
 | `channels` | List channels and status (`active`, `paused`, `blocked`) |
 | `approve <channel>` | Approve queued request and propagate signed channel add |
 | `deny <channel>` | Deny queued request |
@@ -151,9 +152,14 @@ Send one command per line in the LXMF thread; multiple lines are processed in or
 status
 pending
 approve lounge
+recent 5
 pause off-topic
 channels
 ```
+
+Operator actions are stored locally in the node database as an audit trail
+(`approve`, `deny`, `add`, `pause`, `resume`, `block`, startup heartbeat), and
+can be reviewed at any time from the same LXMF thread with `recent`.
 
 Command authorization is strict: only messages received from the exact configured
 `moderation.operator_lxmf_hash` are accepted. Messages from any other LXMF identity are ignored.

@@ -85,3 +85,18 @@ def test_channel_status_controls_active_channel_names(tmp_path):
         assert "spam" not in active
     finally:
         db.close()
+
+
+def test_operator_action_audit_persists_and_orders_recent_first(tmp_path):
+    db_path = tmp_path / "operator-actions.db"
+    db = SpeakeasyDB(str(db_path))
+    try:
+        db.log_operator_action("approve_channel", target="lounge", detail="propagated_to=2")
+        db.log_operator_action("pause_channel", target="off-topic")
+
+        rows = db.get_recent_operator_actions(limit=5)
+        assert len(rows) == 2
+        assert rows[0]["action"] == "pause_channel"
+        assert rows[1]["action"] == "approve_channel"
+    finally:
+        db.close()

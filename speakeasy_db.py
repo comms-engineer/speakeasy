@@ -817,6 +817,16 @@ class SpeakeasyDB(CalendarStore):
                 )
             """)
 
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS operator_actions (
+                    action_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    timestamp REAL,
+                    action TEXT,
+                    target TEXT,
+                    detail TEXT
+                )
+            """)
+
             # Client-side channel visibility preferences scoped to a host.
             cursor.execute("""
                 CREATE TABLE IF NOT EXISTS client_channel_prefs (
@@ -957,6 +967,31 @@ class SpeakeasyDB(CalendarStore):
 
     def get_known_hosts(self) -> List[Dict[str, Any]]:
         return self.load_hosts(limit=500)
+
+    def log_operator_action(self, action: str, target: str = "", detail: str = "") -> bool:
+        with self._tx() as cursor:
+            cursor.execute(
+                """
+                INSERT INTO operator_actions (timestamp, action, target, detail)
+                VALUES (?, ?, ?, ?)
+                """,
+                (time.time(), str(action or ""), str(target or ""), str(detail or "")),
+            )
+        return True
+
+    def get_recent_operator_actions(self, limit: int = 10) -> List[Dict[str, Any]]:
+        max_rows = max(1, min(int(limit or 10), 100))
+        with self._tx() as cursor:
+            cursor.execute(
+                """
+                SELECT action_id, timestamp, action, target, detail
+                FROM operator_actions
+                ORDER BY timestamp DESC, action_id DESC
+                LIMIT ?
+                """,
+                (max_rows,),
+            )
+            return [dict(row) for row in cursor.fetchall()]
 
     def resolve_identity(self, needle: str) -> Optional[str]:
         """

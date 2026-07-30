@@ -19,7 +19,7 @@ logger = logging.getLogger("speakeasy_daemon.operator")
 
 DISPLAY_NAME = "Speakeasy Hub"
 USAGE = (
-    "Commands: help | status | pending | channels | requests | "
+    "Commands: help | status | pending | channels | requests | recent [N] | "
     "approve <channel> | deny <channel> | add <channel> [description] | "
     "pause <channel> | resume <channel> | block <channel>"
 )
