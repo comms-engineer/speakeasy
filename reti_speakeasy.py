@@ -864,9 +864,9 @@ class RetiSpeakeasyApp(App):
     #bbs-table { height: 10; margin-bottom: 1; }
     #bbs-viewer { height: 1fr; border: solid $accent; background: $surface-darken-1; }
     #bbs-top-bar { height: 3; align: right middle; margin-bottom: 1; }
-    #calendar-pane { height: 12; border: solid $secondary; background: $surface-darken-1; padding: 1; margin-top: 1; }
-    #calendar-controls { height: 3; align: left middle; margin-bottom: 1; }
-    #calendar-table { height: 8; margin-bottom: 1; }
+    .channel-calendar-pane { height: 12; border: solid $secondary; background: $surface-darken-1; padding: 1; margin-top: 1; }
+    .channel-calendar-controls { height: 3; align: left middle; margin-bottom: 1; }
+    .channel-calendar-table { height: 8; margin-bottom: 1; }
     """
 
     BINDINGS = [
@@ -906,15 +906,14 @@ class RetiSpeakeasyApp(App):
                         clean_id = chan_name.lstrip('#')
                         with TabPane(f"#{clean_id}", id=f"tab-{clean_id}"):
                             yield RichLog(id=f"log-{clean_id}", classes="chat-log", highlight=True, markup=True)
-                    with TabPane(" Calendar", id="tab-calendar"):
-                        with Vertical(id="calendar-pane"):
-                            yield Label(" Channel Calendar", classes="widget-header")
-                            with Horizontal(id="calendar-controls"):
-                                yield Button(" New", id="btn-calendar-new", variant="success")
-                                yield Button(" Edit", id="btn-calendar-edit", variant="primary")
-                                yield Button(" Delete", id="btn-calendar-delete", variant="error")
-                            yield DataTable(id="calendar-table")
-                            yield RichLog(id="calendar-log", classes="chat-log", highlight=True, markup=True)
+                            with Vertical(classes="channel-calendar-pane", id=f"calendar-pane-{clean_id}"):
+                                yield Label(f" {clean_id} Calendar", classes="widget-header")
+                                with Horizontal(classes="channel-calendar-controls"):
+                                    yield Button(" New", id=f"btn-calendar-new-{clean_id}", variant="success")
+                                    yield Button(" Edit", id=f"btn-calendar-edit-{clean_id}", variant="primary")
+                                    yield Button(" Delete", id=f"btn-calendar-delete-{clean_id}", variant="error")
+                                yield DataTable(id=f"calendar-table-{clean_id}")
+                                yield RichLog(id=f"calendar-log-{clean_id}", classes="chat-log", highlight=True, markup=True)
                     with TabPane(" Bulletin Board", id="tab-bbs"):
                         with Vertical(id="bbs-container"):
                             with Horizontal(id="bbs-top-bar"):
@@ -933,9 +932,11 @@ class RetiSpeakeasyApp(App):
         bbs_table.cursor_type = "row"
         bbs_table.add_columns("Title", "Author", "Date")
 
-        calendar_table = self.query_one("#calendar-table", DataTable)
-        calendar_table.cursor_type = "row"
-        calendar_table.add_columns("Title", "When", "Location", "Owner")
+        for calendar_table in self.query("DataTable"):
+            if getattr(calendar_table, "id", "").startswith("calendar-table-"):
+                calendar_table.cursor_type = "row"
+                if not calendar_table.columns:
+                    calendar_table.add_columns("Title", "When", "Location", "Owner")
 
         self.reload_all_chat_logs()
         self.reload_bulletin_board()
@@ -1041,6 +1042,19 @@ class RetiSpeakeasyApp(App):
             tabs.add_pane(TabPane(
                 f"#{clean_id}",
                 RichLog(id=f"log-{clean_id}", classes="chat-log", highlight=True, markup=True),
+                Vertical(
+                    Vertical(
+                        Label(f" {clean_id} Calendar", classes="widget-header"),
+                        Horizontal(classes="channel-calendar-controls")(
+                            Button(" New", id=f"btn-calendar-new-{clean_id}", variant="success"),
+                            Button(" Edit", id=f"btn-calendar-edit-{clean_id}", variant="primary"),
+                            Button(" Delete", id=f"btn-calendar-delete-{clean_id}", variant="error"),
+                        ),
+                        DataTable(id=f"calendar-table-{clean_id}"),
+                        RichLog(id=f"calendar-log-{clean_id}", classes="chat-log", highlight=True, markup=True),
+                        id=f"calendar-pane-{clean_id}",
+                    ),
+                ),
                 id=f"tab-{clean_id}",
             ))
         self.reload_all_chat_logs()
@@ -1137,8 +1151,8 @@ class RetiSpeakeasyApp(App):
     def reload_calendar_events(self) -> None:
         channel = self.get_current_channel()
         try:
-            calendar_log = self.query_one("#calendar-log", RichLog)
-            calendar_table = self.query_one("#calendar-table", DataTable)
+            calendar_log = self.query_one(f"#calendar-log-{channel}", RichLog)
+            calendar_table = self.query_one(f"#calendar-table-{channel}", DataTable)
         except Exception:
             return
 
@@ -1158,8 +1172,9 @@ class RetiSpeakeasyApp(App):
             calendar_table.add_row(event.title, ts, event.location or "TBD", owner, key=event.event_id)
 
     def _selected_calendar_event(self) -> Event | None:
+        channel = self.get_current_channel()
         try:
-            table = self.query_one("#calendar-table", DataTable)
+            table = self.query_one(f"#calendar-table-{channel}", DataTable)
         except Exception:
             return None
         if table.cursor_row is None:
@@ -1181,15 +1196,15 @@ class RetiSpeakeasyApp(App):
             self.action_show_channel_request_modal()
         elif event.button.id == "btn-calendar-open":
             self.action_show_calendar_modal()
-        elif event.button.id == "btn-calendar-new":
+        elif event.button.id.startswith("btn-calendar-new-"):
             self.action_show_calendar_modal()
-        elif event.button.id == "btn-calendar-edit":
+        elif event.button.id.startswith("btn-calendar-edit-"):
             selected = self._selected_calendar_event()
             if selected:
                 self.action_show_calendar_modal(current_event=selected)
             else:
                 self.notify("Select an event first.", severity="warning")
-        elif event.button.id == "btn-calendar-delete":
+        elif event.button.id.startswith("btn-calendar-delete-"):
             selected = self._selected_calendar_event()
             if not selected:
                 self.notify("Select an event first.", severity="warning")

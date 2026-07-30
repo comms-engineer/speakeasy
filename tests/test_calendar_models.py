@@ -35,8 +35,8 @@ def test_calendar_ui_components_are_present():
                 if getattr(widget, "id", None)
             }
             assert "btn-calendar-open" in widget_ids
-            assert "tab-calendar" in widget_ids
-            assert "calendar-log" in widget_ids
+            assert any(widget_id.startswith("calendar-log-") for widget_id in widget_ids)
+            assert any(widget_id.startswith("calendar-table-") for widget_id in widget_ids)
 
     App.run_test = App.run_test
     import asyncio
@@ -64,10 +64,46 @@ def test_calendar_tui_supports_edit_and_delete_controls():
                     for widget in app.query("*")
                     if getattr(widget, "id", None)
                 }
-                assert "calendar-table" in widget_ids
-                assert "btn-calendar-new" in widget_ids
-                assert "btn-calendar-edit" in widget_ids
-                assert "btn-calendar-delete" in widget_ids
+                assert any(widget_id.startswith("calendar-table-") for widget_id in widget_ids)
+                assert any(widget_id.startswith("btn-calendar-new-") for widget_id in widget_ids)
+                assert any(widget_id.startswith("btn-calendar-edit-") for widget_id in widget_ids)
+                assert any(widget_id.startswith("btn-calendar-delete-") for widget_id in widget_ids)
+
+    import asyncio
+    asyncio.run(check_components())
+
+
+def test_channel_tabs_have_their_own_calendar_panels(tmp_path):
+    app = RetiSpeakeasyApp()
+    db_path = tmp_path / "client.db"
+
+    def fake_engine_init(self, ui_callback=None):
+        self.ui_callback = ui_callback
+        self.hash_str = "test-hash"
+        self.db = SpeakeasyDB(str(db_path))
+        self.identity = SimpleNamespace(hash=SimpleNamespace(hex=lambda: "test-identity"))
+        self.host_manager = None
+        self.active_host_link = None
+        self.s2s_engine = None
+        self.host_channels = set()
+
+    async def check_components() -> None:
+        with patch("reti_speakeasy.ReticulumEngine.__init__", fake_engine_init), \
+             patch("reti_speakeasy.client_db_path", return_value=str(db_path)):
+            startup_db = SpeakeasyDB(str(db_path))
+            startup_db.add_channel("general", "Channel #general")
+            startup_db.add_channel("tech", "Channel #tech")
+            startup_db.close()
+            async with app.run_test():
+                widget_ids = {
+                    widget.id
+                    for widget in app.query("*")
+                    if getattr(widget, "id", None)
+                }
+                assert "calendar-table-general" in widget_ids
+                assert "calendar-log-general" in widget_ids
+                assert "calendar-table-tech" in widget_ids
+                assert "calendar-log-tech" in widget_ids
 
     import asyncio
     asyncio.run(check_components())
