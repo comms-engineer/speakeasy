@@ -77,6 +77,11 @@ def human_age(seconds: float) -> str:
 # -----------------------------------------------------------------------------
 
 def calculate_host_score(hops: int, load: int, max_load: int, last_seen: float) -> float:
+    """Return a host ranking score for peer selection.
+
+    Higher scores mean a better host candidate: fewer hops, lower relative
+    load, and more recent observations all increase the result.
+    """
     LAMBDA = 0.00077  # Decay factor (~15m half-life)
     elapsed_seconds = max(0, time.time() - last_seen)
 

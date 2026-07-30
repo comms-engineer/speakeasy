@@ -342,6 +342,11 @@ class SpeakeasyDaemon:
         frames += self.s2s_engine.build_channel_frames(
             [c["name"] for c in self.db.get_signed_channels()]
         )
+        channel_probe_frames = [
+            self.s2s_engine.build_channel_poll_req(channel)
+            for channel in self.db.get_active_channel_names()
+        ]
+        frames.extend(channel_probe_frames)
         if self._send_frames(link, frames) and frames:
             logger.info(f"Bootstrapped peer link with {len(frames)} identity/profile/channel frame(s).")
 

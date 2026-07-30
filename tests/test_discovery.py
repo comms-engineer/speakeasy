@@ -117,6 +117,36 @@ def test_discovery_can_be_disabled(daemon):
     assert daemon.linked == []
 
 
+def test_bootstrap_sends_channel_poll_probes_for_active_channels(daemon):
+    daemon.db.add_channel("lounge", "test")
+    daemon.db.add_channel("events", "test")
+
+    class FakeLinkWithSend(FakeLink):
+        def __init__(self, identity):
+            super().__init__(identity, status=RNS.Link.ACTIVE)
+            self.sent = []
+            self.type = 0
+            self.hash = b"\x00" * 32
+
+        def encrypt(self, data):
+            return data
+
+        def send(self, frame):
+            self.sent.append(frame)
+
+    link = FakeLinkWithSend(RNS.Identity())
+    frames = []
+
+    def capture_send(link_obj, frame):
+        frames.append(frame)
+
+    daemon._send_frames = lambda link_obj, pending: (frames.extend(pending), True)[1]
+    daemon._bootstrap_link(link)
+
+    opcodes = [WireCodec.unpack(frame)[0] for frame in frames]
+    assert sum(1 for opcode in opcodes if opcode == Opcode.CHANNEL_POLL_REQ) >= 2
+
+
 def test_channel_poll_responses_are_cached_for_relay_choices(daemon):
     peer_identity = RNS.Identity()
     link = FakeLink(peer_identity)

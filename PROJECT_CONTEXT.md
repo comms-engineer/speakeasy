@@ -31,6 +31,13 @@ The goal of the project is to provide robust, resilient, and decentralized chann
 * [ ] **Cold-Start Host Recovery:** Client logic to actively probe prior-known Hosts (ordered by host score) on startup rather than passively waiting for Announce packets.
 * [ ] **Host Advertisement Metadata:** Inject host age/uptime metrics into client menu views.
 
+#### Host scoring notes
+Host selection currently uses a simple weighted score that favors hubs that are closer, less loaded, and more recently seen. The score is computed from three factors:
+- Hop score: fewer hops is better, so short paths rank higher.
+- Capacity score: a host with lower load relative to its maximum load is preferred.
+- Freshness decay: older observations lose value over time, so recently seen hosts stay preferred.
+In practice, a higher score means “better candidate host” for connection and recovery workflows.
+
 ### B. Access Control, Moderation & Identity
 * [ ] **Peer-Level User Blacklisting:** Local client-side blacklist controls to mute/block specific identities independently.
 * [ ] **Operator Blacklist Recommendation System:** Out-of-band LXMF broadcast mechanism allowing an operator to send signed blacklisting recommendations (with rationale) to peer operator addresses.
