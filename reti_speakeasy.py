@@ -896,6 +896,8 @@ class ReticulumEngine:
         self.active_host_link = None
         self.current_host_hash = None
         self.auto_failover_enabled = True
+        self._stopped = False
+        self._connect_thread = None
         # Channels the connected host advertised in its FED_HELLO. Anything
         # outside this set is dropped by the hub, so the client must not
         # pretend a message to it was delivered.
@@ -938,11 +940,20 @@ class ReticulumEngine:
         )
 
     def _notify_ui(self, event_type: str, data=None):
-        if self.ui_callback:
+        if self._stopped or not self.ui_callback:
+            return
+        try:
             self.ui_callback(event_type, data)
+        except RuntimeError:
+            # The app may have exited or not yet attached a UI callback.
+            pass
+        except Exception:
+            pass
 
     def connect_to_host(self, hash_hex: str, is_failover: bool = False):
         def _connect_worker():
+            if self._stopped:
+                return
             clean_hex = hash_hex.replace("<", "").replace(">", "").replace(" ", "").replace(":", "")
             try:
                 dest_bytes = bytes.fromhex(clean_hex)
@@ -958,6 +969,8 @@ class ReticulumEngine:
                     identity = RNS.Identity.recall(dest_bytes)
 
                 if identity:
+                    if self._stopped:
+                        return
                     prefix = "Failover" if is_failover else "Connecting"
                     self._notify_ui("system", f"{prefix}: Establishing link to host [{clean_hex[:10]}]...")
                     time.sleep(0.35)
@@ -979,7 +992,8 @@ class ReticulumEngine:
                 if is_failover:
                     self.trigger_auto_failover(exclude_hash=clean_hex)
 
-        threading.Thread(target=_connect_worker, daemon=True).start()
+        self._connect_thread = threading.Thread(target=_connect_worker, daemon=True)
+        self._connect_thread.start()
 
     def _on_link_established(self, link):
         self.active_host_link = link
@@ -1046,6 +1060,23 @@ class ReticulumEngine:
         )
         sync_frame = self.s2s_engine.build_profile_sync(profile_record)
         RNS.Packet(link, sync_frame).send()
+
+    def shutdown(self):
+        self._stopped = True
+        self.auto_failover_enabled = False
+        try:
+            self.host_manager.stop_prober()
+        except Exception:
+            pass
+        try:
+            if self.active_host_link:
+                self.active_host_link.teardown()
+        except Exception:
+            pass
+        try:
+            self.db.close()
+        except Exception:
+            pass
 
     def _on_link_closed(self, link):
         self.active_host_link = None
@@ -1200,7 +1231,7 @@ class ReticulumEngine:
 class RetiSpeakeasyApp(App):
     CSS = """
     Screen { layout: horizontal; background: $surface; }
-    #sidebar { width: 38; height: 100%; background: $panel; border-right: heavy $accent; padding: 0 1; layout: vertical; }
+    #sidebar { width: 40; min-width: 30; max-width: 42; height: 100%; background: $panel; border-right: heavy $accent; padding: 0 1; layout: vertical; }
     #main-area { width: 1fr; height: 100%; layout: vertical; }
     #channel-tabs { height: 1fr; min-height: 12; }
     .widget-header { background: $accent; color: $text; text-style: bold; padding: 0 1; width: 100%; margin-top: 1; }
@@ -1211,7 +1242,7 @@ class RetiSpeakeasyApp(App):
     #chat-input { width: 100%; dock: bottom; margin-top: 1; }
     .sidebar-btn { width: 100%; margin-top: 1; }
     .sidebar-btn.secondary { background: $panel; color: $text; }
-    .hint-text { color: $text-muted; margin-top: 1; }
+    .hint-text { color: $text-muted; margin-top: 1; width: 100%; max-width: 100%; content-align: left middle; text-wrap: wrap; }
     .chat-log { height: 1fr; border: solid $secondary; background: $surface-darken-1; }
     #system-log { height: 1fr; border: solid $secondary; background: $surface-darken-1; min-height: 8; }
     #bbs-container { height: 1fr; layout: vertical; padding: 1; }
@@ -1751,6 +1782,10 @@ class RetiSpeakeasyApp(App):
                 self.reload_calendar_events()
             else:
                 self.notify("You can only delete events you created or own.", severity="error")
+
+    def action_quit(self) -> None:
+        self.engine.shutdown()
+        super().action_quit()
 
     def handle_command(self, text: str) -> None:
         command, _, argument = text[1:].partition(" ")
