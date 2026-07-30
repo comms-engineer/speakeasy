@@ -17,7 +17,6 @@
   "channels": {
     "allowed_channels": [
       "general",
-      "parlor",
       "tech"
     ],
     "channel_blocklist": [],

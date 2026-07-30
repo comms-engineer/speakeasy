@@ -261,9 +261,12 @@ python reti_speakeasy.py [instance_name]
 
 `instance_name` selects an identity and database under `~/.reti_speakeasy`, so several
 clients can share one machine. Press `h` to pick a discovered host, `p` to edit your
-profile, `b` to post a bulletin, `n` to request a new channel. The client mirrors the
-channel list its hub advertises, and refuses to "send" to a channel the hub does not carry
-instead of storing a message nobody will ever receive.
+profile, `b` to post a bulletin, `n` to request a new channel, `m` to manage per-host
+channel visibility, and `x` to purge local data for an old channel from this client
+database. The same purge action is also available from chat input via
+`/dropchannel <name>` or `/purgechannel <name>`. The client mirrors the channel list its
+hub advertises, and refuses to "send" to a channel the hub does not carry instead of
+storing a message nobody will ever receive.
 
 ## Configuration
 

@@ -379,6 +379,89 @@ class ChannelManagerModal(ModalScreen[dict]):
         self.dismiss(None)
 
 
+class LocalChannelPurgeModal(ModalScreen[str]):
+    BINDINGS = [
+        ("escape", "dismiss_modal", "Cancel / Close")
+    ]
+
+    CSS = """
+    LocalChannelPurgeModal {
+        align: center middle;
+        background: rgba(0, 0, 0, 0.85);
+    }
+    #dialog {
+        padding: 1 2;
+        width: 72;
+        height: auto;
+        max-height: 90%;
+        border: thick $warning;
+        background: $surface;
+        layout: vertical;
+    }
+    #local-channel-table {
+        height: 10;
+        margin-bottom: 1;
+    }
+    #purge-warning {
+        color: $text-warning;
+        margin-bottom: 1;
+    }
+    #button-row {
+        height: 3;
+        align: center middle;
+    }
+    Button {
+        margin: 0 1;
+    }
+    """
+
+    def __init__(self, channels: list[dict]):
+        super().__init__()
+        self.channels = channels
+        self.selected_channel = None
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="dialog"):
+            yield Label(" Purge Local Channel Data", id="modal-title")
+            yield DataTable(id="local-channel-table")
+            yield Label(" This removes local channel history/calendar data from this client only.",
+                        id="purge-warning")
+            with Horizontal(id="button-row"):
+                yield Button("Purge Selected", variant="error", id="btn-purge")
+                yield Button("Cancel [Esc]", variant="primary", id="btn-cancel")
+
+    def action_dismiss_modal(self) -> None:
+        self.dismiss(None)
+
+    def on_mount(self) -> None:
+        table = self.query_one("#local-channel-table", DataTable)
+        table.cursor_type = "row"
+        table.add_columns("Channel", "Status")
+        table.clear()
+
+        for channel in sorted(self.channels, key=lambda c: str(c.get("name") or "")):
+            name = str(channel.get("name") or "").lstrip("#")
+            if not name:
+                continue
+            status = str(channel.get("status") or "active").lower()
+            table.add_row(f"#{name}", status, key=name)
+            if self.selected_channel is None:
+                self.selected_channel = name
+
+    def on_data_table_row_selected(self, event: DataTable.RowSelected) -> None:
+        if event.data_table.id == "local-channel-table":
+            self.selected_channel = str(event.row_key.value)
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        if event.button.id == "btn-purge":
+            if self.selected_channel:
+                self.dismiss(self.selected_channel)
+            else:
+                self.dismiss(None)
+            return
+        self.dismiss(None)
+
+
 class BulletinPostModal(ModalScreen[dict]):
     BINDINGS = [("escape", "dismiss_modal", "Cancel / Close")]
 
@@ -1017,6 +1100,7 @@ class RetiSpeakeasyApp(App):
         ("b", "show_bulletin_modal", "New Bulletin"),
         ("n", "show_channel_request_modal", "Request Channel"),
         ("m", "show_channel_manager_modal", "Manage Channels"),
+        ("x", "show_local_channel_purge_modal", "Purge Local Channel"),
         ("c", "show_calendar_modal", "Calendar Event"),
     ]
 
@@ -1039,6 +1123,7 @@ class RetiSpeakeasyApp(App):
                 yield Button(" New Bulletin (B)", id="btn-bulletin-open", classes="sidebar-btn", variant="success")
                 yield Button(" Request Channel (N)", id="btn-channel-open", classes="sidebar-btn", variant="warning")
                 yield Button(" Manage Channels (M)", id="btn-channel-manage", classes="sidebar-btn", variant="primary")
+                yield Button(" Purge Local Channel (X)", id="btn-channel-purge", classes="sidebar-btn", variant="error")
                 yield Button(" New Calendar Event (C)", id="btn-calendar-open", classes="sidebar-btn", variant="primary")
                 yield Label(" System Log", classes="widget-header")
                 yield RichLog(id="system-log", classes="chat-log", highlight=True, markup=True)
@@ -1063,7 +1148,7 @@ class RetiSpeakeasyApp(App):
                                 yield Button(" Post New Bulletin", id="btn-bbs-post", variant="success")
                             yield DataTable(id="bbs-table")
                             yield RichLog(id="bbs-viewer", classes="chat-log", highlight=True, markup=True)
-                yield Input(placeholder="Message, or /block <handle> /unblock <handle> /blocked",
+                yield Input(placeholder="Message, or /block /unblock /blocked /dropchannel <name>",
                             id="chat-input")
         yield Footer()
 
@@ -1256,6 +1341,49 @@ class RetiSpeakeasyApp(App):
         self.push_screen(ChannelManagerModal(host_label=host_key, channels=channels, visibility=visibility),
                          handle_visibility)
 
+    def action_show_local_channel_purge_modal(self) -> None:
+        channels = [
+            ch for ch in self.engine.db.get_channels()
+            if str(ch.get("name") or "").strip().lower() != "bbs"
+        ]
+        if not channels:
+            self.notify("No local channels to purge.", severity="warning")
+            return
+
+        def handle_purge(channel_name: str | None) -> None:
+            if channel_name:
+                self._purge_local_channel(channel_name)
+
+        self.push_screen(LocalChannelPurgeModal(channels=channels), handle_purge)
+
+    def _purge_local_channel(self, channel: str) -> None:
+        clean = str(channel or "").lstrip("#").strip().lower()
+        if not clean or clean == "bbs":
+            self.handle_engine_event("system", "[bold red]Refused:[/] invalid channel name.")
+            return
+
+        counts = self.engine.db.purge_local_channel(clean)
+        total = sum(int(v) for v in counts.values()) if counts else 0
+
+        if self.engine.current_host_hash and clean in self.engine.host_channels:
+            self.engine.db.set_channel_visibility(self.engine.current_host_hash, clean, False)
+
+        try:
+            pane = self.query_one(f"#tab-{clean}", TabPane)
+            pane.display = False
+            tabs = self.query_one("#channel-tabs", TabbedContent)
+            if tabs.active == f"tab-{clean}":
+                tabs.active = "tab-bbs"
+        except Exception:
+            pass
+
+        self.reload_all_chat_logs()
+        self.reload_calendar_events()
+        self.handle_engine_event(
+            "system",
+            f"[bold green]Purged:[/] local channel #{clean} ({total} record(s) removed).",
+        )
+
     def action_show_channel_request_modal(self) -> None:
         def handle_request(data: dict | None) -> None:
             if data:
@@ -1393,6 +1521,8 @@ class RetiSpeakeasyApp(App):
             self.action_show_channel_request_modal()
         elif event.button.id == "btn-channel-manage":
             self.action_show_channel_manager_modal()
+        elif event.button.id == "btn-channel-purge":
+            self.action_show_local_channel_purge_modal()
         elif event.button.id == "btn-calendar-open":
             self.action_show_calendar_modal()
         elif event.button.id.startswith("btn-calendar-new-"):
@@ -1425,10 +1555,13 @@ class RetiSpeakeasyApp(App):
             self.engine.unblock_identity(argument)
         elif command == "blocked":
             self.engine.list_blocked()
+        elif command in {"dropchannel", "purgechannel"} and argument:
+            self._purge_local_channel(argument)
         else:
             self.handle_engine_event(
                 "system",
-                "[bold yellow]Commands:[/] /block <handle|hash>, /unblock <handle|hash>, /blocked"
+                "[bold yellow]Commands:[/] /block <handle|hash>, /unblock <handle|hash>, /blocked, "
+                "/dropchannel <name>"
             )
 
     def handle_engine_event(self, event_type: str, data) -> None:

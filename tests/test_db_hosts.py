@@ -100,3 +100,31 @@ def test_operator_action_audit_persists_and_orders_recent_first(tmp_path):
         assert rows[1]["action"] == "approve_channel"
     finally:
         db.close()
+
+
+def test_purge_local_channel_removes_related_rows(tmp_path):
+    db_path = tmp_path / "purge-channel.db"
+    db = SpeakeasyDB(str(db_path))
+    try:
+        db.add_channel("legacy", "old room")
+        db.set_channel_visibility("aa" * 16, "legacy", False)
+
+        with db._tx() as cursor:
+            cursor.execute(
+                "INSERT INTO messages (msg_id, channel, sender_hash, content, timestamp, signature) VALUES (?, ?, ?, ?, ?, ?)",
+                ("f" * 64, "legacy", "1" * 32, "hello", 1.0, b""),
+            )
+            cursor.execute(
+                "INSERT INTO channel_requests (name, description, requester_hash, requested_at, status, decided_at) VALUES (?, ?, ?, ?, ?, ?)",
+                ("legacy", "old", "2" * 32, 1.0, "pending", None),
+            )
+
+        deleted = db.purge_local_channel("legacy")
+
+        assert deleted["channels"] >= 1
+        assert deleted["messages"] >= 1
+        assert deleted["channel_requests"] >= 1
+        assert db.get_channel("legacy") is None
+        assert db.get_channel_messages("legacy", limit=10) == []
+    finally:
+        db.close()

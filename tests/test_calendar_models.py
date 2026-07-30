@@ -35,6 +35,7 @@ def test_calendar_ui_components_are_present():
                 if getattr(widget, "id", None)
             }
             assert "btn-calendar-open" in widget_ids
+            assert "btn-channel-purge" in widget_ids
             assert any(widget_id.startswith("calendar-log-") for widget_id in widget_ids)
             assert any(widget_id.startswith("calendar-table-") for widget_id in widget_ids)
 

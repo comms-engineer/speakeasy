@@ -1736,6 +1736,45 @@ class SpeakeasyDB(CalendarStore):
             except sqlite3.IntegrityError:
                 return False
 
+    def purge_local_channel(self, channel_name: str) -> Dict[str, int]:
+        """
+        Deletes local records tied to one channel.
+
+        Intended for client-side cleanup of stale channels and their associated
+        local history/calendar state. Returns per-table delete counts.
+        """
+        chan = str(channel_name or "").lstrip("#").strip()
+        if not chan:
+            return {}
+
+        deleted: Dict[str, int] = {}
+        with self._tx() as cursor:
+            cursor.execute(
+                "DELETE FROM event_change WHERE event_id IN (SELECT event_id FROM event WHERE channel = ?)",
+                (chan,),
+            )
+            deleted["event_change"] = cursor.rowcount
+
+            cursor.execute("DELETE FROM event WHERE channel = ?", (chan,))
+            deleted["event"] = cursor.rowcount
+
+            cursor.execute("DELETE FROM calendar WHERE channel = ? OR calendar_id = ?", (chan, chan))
+            deleted["calendar"] = cursor.rowcount
+
+            cursor.execute("DELETE FROM messages WHERE channel = ?", (chan,))
+            deleted["messages"] = cursor.rowcount
+
+            cursor.execute("DELETE FROM channel_requests WHERE name = ?", (chan,))
+            deleted["channel_requests"] = cursor.rowcount
+
+            cursor.execute("DELETE FROM channels WHERE name = ?", (chan,))
+            deleted["channels"] = cursor.rowcount
+
+            cursor.execute("DELETE FROM client_channel_prefs WHERE channel_name = ?", (chan,))
+            deleted["client_channel_prefs"] = cursor.rowcount
+
+        return deleted
+
     def get_channel_messages(self, channel_id: str, limit: int = 50) -> List[Dict[str, Any]]:
         """Fetch the most recent messages for a given channel, ordered chronologically with alias resolution."""
         query = """
