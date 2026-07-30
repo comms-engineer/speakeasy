@@ -462,6 +462,89 @@ class LocalChannelPurgeModal(ModalScreen[str]):
         self.dismiss(None)
 
 
+class LocalChannelRestoreModal(ModalScreen[str]):
+    BINDINGS = [
+        ("escape", "dismiss_modal", "Cancel / Close")
+    ]
+
+    CSS = """
+    LocalChannelRestoreModal {
+        align: center middle;
+        background: rgba(0, 0, 0, 0.85);
+    }
+    #dialog {
+        padding: 1 2;
+        width: 72;
+        height: auto;
+        max-height: 90%;
+        border: thick $success;
+        background: $surface;
+        layout: vertical;
+    }
+    #restore-channel-table {
+        height: 10;
+        margin-bottom: 1;
+    }
+    #restore-help {
+        color: $text-muted;
+        margin-bottom: 1;
+    }
+    #button-row {
+        height: 3;
+        align: center middle;
+    }
+    Button {
+        margin: 0 1;
+    }
+    """
+
+    def __init__(self, channels: list[dict]):
+        super().__init__()
+        self.channels = channels
+        self.selected_channel = None
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="dialog"):
+            yield Label(" Restore Purged Channel", id="modal-title")
+            yield DataTable(id="restore-channel-table")
+            yield Label(" Restoring removes the local purge mark. The tab returns if the current host advertises it.",
+                        id="restore-help")
+            with Horizontal(id="button-row"):
+                yield Button("Restore Selected", variant="success", id="btn-restore")
+                yield Button("Cancel [Esc]", variant="primary", id="btn-cancel")
+
+    def action_dismiss_modal(self) -> None:
+        self.dismiss(None)
+
+    def on_mount(self) -> None:
+        table = self.query_one("#restore-channel-table", DataTable)
+        table.cursor_type = "row"
+        table.add_columns("Channel", "Available Now")
+        table.clear()
+
+        for channel in sorted(self.channels, key=lambda c: str(c.get("name") or "")):
+            name = str(channel.get("name") or "").lstrip("#")
+            if not name:
+                continue
+            available_now = "yes" if channel.get("available_now") else "no"
+            table.add_row(f"#{name}", available_now, key=name)
+            if self.selected_channel is None:
+                self.selected_channel = name
+
+    def on_data_table_row_selected(self, event: DataTable.RowSelected) -> None:
+        if event.data_table.id == "restore-channel-table":
+            self.selected_channel = str(event.row_key.value)
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        if event.button.id == "btn-restore":
+            if self.selected_channel:
+                self.dismiss(self.selected_channel)
+            else:
+                self.dismiss(None)
+            return
+        self.dismiss(None)
+
+
 class BulletinPostModal(ModalScreen[dict]):
     BINDINGS = [("escape", "dismiss_modal", "Cancel / Close")]
 
@@ -1101,6 +1184,7 @@ class RetiSpeakeasyApp(App):
         ("n", "show_channel_request_modal", "Request Channel"),
         ("m", "show_channel_manager_modal", "Manage Channels"),
         ("x", "show_local_channel_purge_modal", "Purge Local Channel"),
+        ("r", "show_local_channel_restore_modal", "Restore Channel"),
         ("c", "show_calendar_modal", "Calendar Event"),
     ]
 
@@ -1124,6 +1208,7 @@ class RetiSpeakeasyApp(App):
                 yield Button(" Request Channel (N)", id="btn-channel-open", classes="sidebar-btn", variant="warning")
                 yield Button(" Manage Channels (M)", id="btn-channel-manage", classes="sidebar-btn", variant="primary")
                 yield Button(" Purge Local Channel (X)", id="btn-channel-purge", classes="sidebar-btn", variant="error")
+                yield Button(" Restore Channel (R)", id="btn-channel-restore", classes="sidebar-btn", variant="success")
                 yield Button(" New Calendar Event (C)", id="btn-calendar-open", classes="sidebar-btn", variant="primary")
                 yield Label(" System Log", classes="widget-header")
                 yield RichLog(id="system-log", classes="chat-log", highlight=True, markup=True)
@@ -1148,7 +1233,7 @@ class RetiSpeakeasyApp(App):
                                 yield Button(" Post New Bulletin", id="btn-bbs-post", variant="success")
                             yield DataTable(id="bbs-table")
                             yield RichLog(id="bbs-viewer", classes="chat-log", highlight=True, markup=True)
-                yield Input(placeholder="Message, or /block /unblock /blocked /dropchannel <name>",
+                yield Input(placeholder="Message, or /block /unblock /blocked /dropchannel <name> /restorechannel <name>",
                             id="chat-input")
         yield Footer()
 
@@ -1258,10 +1343,13 @@ class RetiSpeakeasyApp(App):
         """Shows only channels carried by the host and enabled in local prefs."""
         tabs = self.query_one("#channel-tabs", TabbedContent)
         host_key = (self.engine.current_host_hash or "").lower()
+        purged = self.engine.db.get_purged_channel_names()
         available = []
         for name in channel_names:
             clean_id = str(name).lstrip("#")
             if not clean_id:
+                continue
+            if clean_id in purged:
                 continue
             available.append(clean_id)
             self.engine.db.add_channel(clean_id, f"Channel #{clean_id}")
@@ -1308,6 +1396,11 @@ class RetiSpeakeasyApp(App):
             if not pane_id.startswith("tab-") or pane_id == "tab-bbs":
                 continue
             channel = pane_id.replace("tab-", "", 1)
+            if channel in purged:
+                if tabs.active == pane_id:
+                    tabs.active = "tab-bbs"
+                tabs.remove_pane(pane_id)
+                continue
             if channel not in set(available):
                 pane.display = False
 
@@ -1324,7 +1417,12 @@ class RetiSpeakeasyApp(App):
             self.notify("Connect to a host first.", severity="warning")
             return
 
-        channels = sorted(str(c).lstrip("#") for c in self.engine.host_channels if str(c).strip())
+        purged = self.engine.db.get_purged_channel_names()
+        channels = sorted(
+            str(c).lstrip("#")
+            for c in self.engine.host_channels
+            if str(c).strip() and str(c).lstrip("#") not in purged
+        )
         if not channels:
             self.notify("No channels advertised by the host yet.", severity="warning")
             return
@@ -1357,6 +1455,25 @@ class RetiSpeakeasyApp(App):
 
         self.push_screen(LocalChannelPurgeModal(channels=channels), handle_purge)
 
+    def action_show_local_channel_restore_modal(self) -> None:
+        purged = sorted(self.engine.db.get_purged_channel_names())
+        if not purged:
+            self.notify("No purged channels to restore.", severity="warning")
+            return
+
+        host_channels = {str(ch).lstrip("#") for ch in self.engine.host_channels if str(ch).strip()}
+        channels = [
+            {"name": channel, "available_now": channel in host_channels}
+            for channel in purged
+            if channel != "bbs"
+        ]
+
+        def handle_restore(channel_name: str | None) -> None:
+            if channel_name:
+                self._restore_local_channel(channel_name)
+
+        self.push_screen(LocalChannelRestoreModal(channels=channels), handle_restore)
+
     def _purge_local_channel(self, channel: str) -> None:
         clean = str(channel or "").lstrip("#").strip().lower()
         if not clean or clean == "bbs":
@@ -1371,11 +1488,10 @@ class RetiSpeakeasyApp(App):
 
         try:
             tabs = self.query_one("#channel-tabs", TabbedContent)
-            pane = self.query_one(f"#tab-{clean}", TabPane)
             if tabs.active == f"tab-{clean}":
                 tabs.active = "tab-bbs"
-            # Remove the pane so the tab header disappears immediately.
-            pane.remove()
+            # Remove both the pane content and the tab header immediately.
+            tabs.remove_pane(f"tab-{clean}")
         except Exception:
             pass
 
@@ -1384,6 +1500,36 @@ class RetiSpeakeasyApp(App):
         self.handle_engine_event(
             "system",
             f"[bold green]Purged:[/] local channel #{clean} ({total} record(s) removed).",
+        )
+
+    def _restore_local_channel(self, channel: str) -> None:
+        clean = str(channel or "").lstrip("#").strip().lower()
+        if not clean or clean == "bbs":
+            self.handle_engine_event("system", "[bold red]Refused:[/] invalid channel name.")
+            return
+
+        if not self.engine.db.unmark_channel_purged(clean):
+            self.handle_engine_event("system", f"[bold yellow]Not purged:[/] #{clean}.")
+            return
+
+        if self.engine.current_host_hash and clean in self.engine.host_channels:
+            self.engine.db.set_channel_visibility(self.engine.current_host_hash, clean, True)
+            self.sync_channel_tabs(sorted(self.engine.host_channels))
+            try:
+                tabs = self.query_one("#channel-tabs", TabbedContent)
+                tabs.active = f"tab-{clean}"
+            except Exception:
+                pass
+            self.reload_calendar_events()
+            self.handle_engine_event(
+                "system",
+                f"[bold green]Restored:[/] #{clean} is visible again for the current host.",
+            )
+            return
+
+        self.handle_engine_event(
+            "system",
+            f"[bold green]Restored:[/] #{clean} will reappear when a connected host advertises it.",
         )
 
     def action_show_channel_request_modal(self) -> None:
@@ -1525,6 +1671,8 @@ class RetiSpeakeasyApp(App):
             self.action_show_channel_manager_modal()
         elif event.button.id == "btn-channel-purge":
             self.action_show_local_channel_purge_modal()
+        elif event.button.id == "btn-channel-restore":
+            self.action_show_local_channel_restore_modal()
         elif event.button.id == "btn-calendar-open":
             self.action_show_calendar_modal()
         elif event.button.id.startswith("btn-calendar-new-"):
@@ -1559,11 +1707,13 @@ class RetiSpeakeasyApp(App):
             self.engine.list_blocked()
         elif command in {"dropchannel", "purgechannel"} and argument:
             self._purge_local_channel(argument)
+        elif command in {"restorechannel", "undropchannel"} and argument:
+            self._restore_local_channel(argument)
         else:
             self.handle_engine_event(
                 "system",
                 "[bold yellow]Commands:[/] /block <handle|hash>, /unblock <handle|hash>, /blocked, "
-                "/dropchannel <name>"
+                "/dropchannel <name>, /restorechannel <name>"
             )
 
     def handle_engine_event(self, event_type: str, data) -> None:

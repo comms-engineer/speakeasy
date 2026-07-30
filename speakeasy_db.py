@@ -838,6 +838,13 @@ class SpeakeasyDB(CalendarStore):
                 )
             """)
 
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS purged_channels (
+                    channel_name TEXT PRIMARY KEY,
+                    purged_at REAL
+                )
+            """)
+
             # Epoch sync scans messages by (channel, timestamp) range on every
             # anti-entropy round; the bulletin index backs the board view.
             cursor.execute("CREATE INDEX IF NOT EXISTS idx_messages_channel_ts ON messages (channel, timestamp)")
@@ -1549,14 +1556,45 @@ class SpeakeasyDB(CalendarStore):
     def get_visible_channels(self, host_hash: str, channel_names: Iterable[str],
                              default_visible: bool = True) -> List[str]:
         prefs = self.get_channel_visibility_map(host_hash)
+        purged = self.get_purged_channel_names()
         visible = []
         for raw in channel_names:
             chan = str(raw or "").lstrip("#").strip()
             if not chan:
                 continue
+            if chan in purged:
+                continue
             if prefs.get(chan, default_visible):
                 visible.append(chan)
         return visible
+
+    def mark_channel_purged(self, channel_name: str) -> bool:
+        chan = str(channel_name or "").lstrip("#").strip()
+        if not chan:
+            return False
+        with self._tx() as cursor:
+            cursor.execute(
+                """
+                INSERT INTO purged_channels (channel_name, purged_at)
+                VALUES (?, ?)
+                ON CONFLICT(channel_name) DO UPDATE SET purged_at = excluded.purged_at
+                """,
+                (chan, time.time()),
+            )
+        return True
+
+    def unmark_channel_purged(self, channel_name: str) -> bool:
+        chan = str(channel_name or "").lstrip("#").strip()
+        if not chan:
+            return False
+        with self._tx() as cursor:
+            cursor.execute("DELETE FROM purged_channels WHERE channel_name = ?", (chan,))
+            return cursor.rowcount > 0
+
+    def get_purged_channel_names(self) -> set[str]:
+        with self._tx() as cursor:
+            cursor.execute("SELECT channel_name FROM purged_channels")
+            return {str(row[0]).lstrip("#").strip() for row in cursor.fetchall() if str(row[0]).strip()}
 
     def get_channels(self) -> List[Dict[str, Any]]:
         """Returns all channel records as dictionaries for UI composition."""
@@ -1792,6 +1830,16 @@ class SpeakeasyDB(CalendarStore):
 
             cursor.execute("DELETE FROM client_channel_prefs WHERE channel_name = ?", (chan,))
             deleted["client_channel_prefs"] = cursor.rowcount
+
+            cursor.execute(
+                """
+                INSERT INTO purged_channels (channel_name, purged_at)
+                VALUES (?, ?)
+                ON CONFLICT(channel_name) DO UPDATE SET purged_at = excluded.purged_at
+                """,
+                (chan, time.time()),
+            )
+            deleted["purged_channels"] = cursor.rowcount
 
         return deleted
 
