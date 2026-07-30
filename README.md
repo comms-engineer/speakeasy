@@ -12,11 +12,11 @@ signed by its author's RNS identity, so authorship survives relaying across untr
 | File | Role |
 | --- | --- |
 | `speakeasy_daemon.py` | Hub daemon: announces itself, accepts client/peer links, relays and stores verified records |
-| `reti_speakeasy.py` | Textual TUI client: host discovery and ranking, channels, bulletin board, profile |
+| `reti_speakeasy.py` | Textual TUI client: host discovery and ranking, channels, bulletin board, comments, profile |
 | `fed_engine.py` | S2S wire protocol (msgpack frames) and the epoch anti-entropy state machine |
-| `speakeasy_db.py` | SQLite storage, verification choke point, epoch Merkle roots |
+| `speakeasy_db.py` | SQLite storage, verification choke point, epoch Merkle roots, local moderation state |
 | `signing.py` | Canonical byte encodings, signing, and verification |
-| `operator_iface.py` | LXMF endpoint that pages the hub operator and takes `approve` / `deny` replies |
+| `operator_iface.py` | LXMF endpoint that pages the hub operator, accepts management commands, and exchanges peer operator recommendations |
 | `speakeasy_admin.py` | Offline CLI for reviewing the channel-request queue |
 
 ## Trust model
@@ -48,6 +48,10 @@ EPOCH_SYNC_RESP    -> roots; a mismatch means divergence
 DELTA_REQ          -> "here are the ids I hold; send what I lack"
 DELTA_PUSH         -> the missing signed records (MDU-sized batches)
 ```
+
+`FED_HELLO` also carries optional peer operator metadata now: when LXMF operator control is
+enabled, a hub advertises its operator endpoint hash there so peer hubs can learn where to
+send blacklist recommendations out of band.
 
 `DELTA_REQ` doubles as an advertisement of what the requester holds, so reconciliation is
 symmetric: both sides end an exchange with the same records. Peers must agree on
@@ -139,6 +143,10 @@ Send one command per line in the LXMF thread; multiple lines are processed in or
 | `pending` or `requests` | List pending channel nominations |
 | `recent [N]` or `audit [N]` | Show most recent operator actions (default 10, max 50) |
 | `channels` | List channels and status (`active`, `paused`, `blocked`) |
+| `recommend <identity> <reason>` | Broadcast a blacklist recommendation to known peer operators |
+| `recommendations [N]` or `recs [N]` | Review aggregated inbound blacklist recommendations |
+| `blockid <identity> [reason]` | Locally block an identity on this hub and purge its stored content |
+| `unblockid <identity>` | Lift a local hub-level identity block |
 | `approve <channel>` | Approve queued request and propagate signed channel add |
 | `deny <channel>` | Deny queued request |
 | `add <channel> [description]` | Create + approve channel immediately |
@@ -152,14 +160,23 @@ Send one command per line in the LXMF thread; multiple lines are processed in or
 status
 pending
 approve lounge
+recommend deadbeefdeadbeef spam flood from mirror hubs
+recommendations 5
+blockid deadbeefdeadbeef repeated forged traffic
 recent 5
 pause off-topic
 channels
 ```
 
 Operator actions are stored locally in the node database as an audit trail
-(`approve`, `deny`, `add`, `pause`, `resume`, `block`, startup heartbeat), and
-can be reviewed at any time from the same LXMF thread with `recent`.
+(`approve`, `deny`, `add`, `pause`, `resume`, `block`, `recommend`, `blockid`,
+`unblockid`, startup heartbeat, and inbound recommendation receipts), and can be
+reviewed at any time from the same LXMF thread with `recent`.
+
+Blacklist recommendations are advisory rather than automatic enforcement. A hub stores
+inbound recommendations with their source and rationale, suppresses exact duplicate
+submissions, and the `recommendations` view groups repeated reports by target identity so
+the operator can see how many distinct peers have flagged the same identity before acting.
 
 Command authorization is strict: only messages received from the exact configured
 `moderation.operator_lxmf_hash` are accepted. Messages from any other LXMF identity are ignored.
@@ -227,8 +244,32 @@ against a running node takes effect on the next frame rather than the next resta
 
 From the client, `/block <handle|hash>` blocks an identity **for that client only** and
 purges what they already posted from its database, `/unblock` lifts it and `/blocked` lists
-both scopes, marking operator blackholes as such. Blocked authors are also filtered out of
-already-stored history when a channel is rendered.
+both scopes, marking operator blackholes as such. The TUI also exposes the same local list
+through a dedicated Peer Blacklist manager. Blocked authors are filtered out of already-stored
+chat, bulletin, and calendar history when those views are rendered.
+
+At the hub/operator scope, `blockid <identity> [reason]` and `unblockid <identity>` do the
+same thing for the daemon's own local database: a blocked identity's stored messages,
+bulletins, comments, profiles, and authored calendar events are purged from that node while
+future records from the same identity continue to be refused by the record-layer checks.
+
+Peer operators can also exchange **blacklist recommendations** over LXMF. Those do not block
+anyone automatically; they populate the operator review queue so each hub can decide whether
+to apply a local block or a node-wide `rnpath -B` blackhole.
+
+## Bulletin board
+
+The BBS now has a real local lifecycle rather than acting as a flat append-only list.
+
+- Bulletins auto-archive after 7 days by default.
+- The active and archived sets can be browsed separately from the BBS view.
+- The author of a bulletin can delete it locally from the client.
+- The selected bulletin can be manually archived or restored from the BBS controls.
+- When the BBS tab is active, the shared input box at the bottom of the screen becomes a
+  reply box for the selected bulletin, storing threaded comments under that bulletin.
+
+Comments are currently local client state: they are stored in the client's database and shown
+in the bulletin viewer, but they are not yet federated over the Speakeasy wire protocol.
 
 A client block is stored in the client's own database, *not* in RNS's blackhole list, and so
 will not appear in `rnpath -b`. This is deliberate: that list is node-wide state owned by
@@ -267,12 +308,18 @@ python reti_speakeasy.py [instance_name]
 
 `instance_name` selects an identity and database under `~/.reti_speakeasy`, so several
 clients can share one machine. Press `h` to pick a discovered host, `p` to edit your
-profile, `b` to post a bulletin, `n` to request a new channel, `m` to manage per-host
-channel visibility, and `x` to purge local data for an old channel from this client
-database. The same purge action is also available from chat input via
-`/dropchannel <name>` or `/purgechannel <name>`. The client mirrors the channel list its
-hub advertises, and refuses to "send" to a channel the hub does not carry instead of
-storing a message nobody will ever receive.
+profile, `b` to post a bulletin, `k` to manage the local peer blacklist, `n` to request a
+new channel, `m` to manage per-host channel visibility, `x` to purge local data for an old
+channel from this client database, and `r` to restore a previously purged channel. On the
+BBS tab, the bottom input box posts a comment to the selected bulletin rather than sending a
+chat message. The same purge action is also available from chat input via `/dropchannel <name>`
+or `/purgechannel <name>`. The client mirrors the channel list its hub advertises, and refuses
+to "send" to a channel the hub does not carry instead of storing a message nobody will ever
+receive.
+
+Host recovery is proactive: the client keeps a DB-backed host cache, scores candidates by
+hops/load/freshness, actively probes known hosts on startup, and can filter discovered hubs by
+their announced channel summaries before connecting.
 
 ## Configuration
 
@@ -305,6 +352,10 @@ storing a message nobody will ever receive.
 | `storage.vacuum_interval_hours` | How often freed pages are returned to the filesystem |
 | `logging.*` | Log level and optional log file |
 
+Session/load accounting on the daemon only counts links that are actually `ACTIVE`, and closed
+links are pruned before announce/load decisions. That prevents reconnect churn from inflating
+the hub's advertised load or exhausting `node.max_clients` with stale link objects.
+
 ## Development
 
 ```bash
@@ -316,4 +367,6 @@ pytest -q
 
 Tests cover wire-frame round trips, signature tampering and impersonation rejection, two
 in-process hubs converging over a simulated link, key/profile gossip and out-of-order key
-recovery, signed channel approval and its propagation, and announce-driven peer discovery.
+recovery, signed channel approval and its propagation, announce-driven peer discovery,
+operator LXMF management and blacklist recommendations, local identity blocking, and the
+client-side bulletin/calendar moderation and lifecycle controls.
