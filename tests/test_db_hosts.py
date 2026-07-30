@@ -62,3 +62,26 @@ def test_channel_visibility_preferences_are_scoped_per_host(tmp_path):
         assert visible_b == ["general", "tech", "music"]
     finally:
         db.close()
+
+
+def test_channel_status_controls_active_channel_names(tmp_path):
+    db_path = tmp_path / "channel-status.db"
+    db = SpeakeasyDB(str(db_path))
+    try:
+        db.add_channel("ops", "operator channel", status="active")
+        db.add_channel("quiet", "quiet channel", status="paused")
+        db.add_channel("spam", "spam channel", status="blocked")
+
+        assert db.get_channel_status("ops") == "active"
+        assert db.get_channel_status("quiet") == "paused"
+        assert db.get_channel_status("spam") == "blocked"
+
+        assert db.set_channel_status("quiet", "active")
+        assert db.get_channel_status("quiet") == "active"
+
+        active = set(db.get_active_channel_names())
+        assert "ops" in active
+        assert "quiet" in active
+        assert "spam" not in active
+    finally:
+        db.close()

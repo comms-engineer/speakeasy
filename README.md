@@ -100,7 +100,14 @@ from that exact source hash. Otherwise use the CLI, which drives the same queue:
 python speakeasy_admin.py pending
 python speakeasy_admin.py approve lounge
 python speakeasy_admin.py deny spam
+python speakeasy_admin.py add events --description "Community events"
+python speakeasy_admin.py pause lounge
+python speakeasy_admin.py resume lounge
+python speakeasy_admin.py block spam
 ```
+
+`pause` keeps a channel defined but refuses traffic, `resume` re-enables it, and
+`block` refuses both traffic and future requests for that channel.
 
 > **Not yet verified on real hardware:** the LXMF path has only been smoke-tested — the
 > endpoint starts and announces, and the source-hash authorisation is in place, but issuing

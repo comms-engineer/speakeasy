@@ -18,7 +18,10 @@ import RNS
 logger = logging.getLogger("speakeasy_daemon.operator")
 
 DISPLAY_NAME = "Speakeasy Hub"
-USAGE = "Commands: approve <channel> | deny <channel> | pending | channels"
+USAGE = (
+    "Commands: approve <channel> | deny <channel> | add <channel> [description] | "
+    "pause <channel> | resume <channel> | block <channel> | pending | channels"
+)
 
 
 class OperatorInterface:
@@ -82,7 +85,7 @@ class OperatorInterface:
         body = (f"#{name} requested on {self.node_name}\n"
                 f"By: {requester}\n"
                 f"Description: {description or '(none)'}\n\n"
-                f"Reply 'approve {name}' or 'deny {name}'.")
+            f"Reply 'approve {name}', 'deny {name}', or pre-create with 'add {name}'.")
         return self.notify("Channel request", body)
 
     def _on_lxmf_delivery(self, message):

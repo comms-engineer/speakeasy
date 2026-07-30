@@ -774,9 +774,10 @@ class SpeakeasyDB(CalendarStore):
                 )
             """)
             existing_cols = {row[1] for row in cursor.execute("PRAGMA table_info(channels)")}
-            for column, decl in (("approver_hash", "TEXT"), ("signature", "BLOB")):
+            for column, decl in (("approver_hash", "TEXT"), ("signature", "BLOB"), ("status", "TEXT")):
                 if column not in existing_cols:
                     cursor.execute(f"ALTER TABLE channels ADD COLUMN {column} {decl}")
+            cursor.execute("UPDATE channels SET status = 'active' WHERE status IS NULL OR status = ''")
 
             # Channel creation requests awaiting an operator decision.
             cursor.execute("""
@@ -1528,16 +1529,45 @@ class SpeakeasyDB(CalendarStore):
             cursor.execute("SELECT * FROM channels ORDER BY name ASC")
             return [dict(row) for row in cursor.fetchall()]
 
+    def get_active_channel_names(self) -> List[str]:
+        """Channel names currently hosted for traffic and federation."""
+        with self._tx() as cursor:
+            cursor.execute(
+                "SELECT name FROM channels WHERE COALESCE(status, 'active') = 'active' ORDER BY name ASC"
+            )
+            return [row[0] for row in cursor.fetchall()]
+
     def get_channel(self, name: str) -> Optional[Dict[str, Any]]:
         with self._tx() as cursor:
             cursor.execute("SELECT * FROM channels WHERE name = ?", (name,))
             row = cursor.fetchone()
         return dict(row) if row else None
 
+    def get_channel_status(self, name: str) -> Optional[str]:
+        record = self.get_channel(name)
+        if not record:
+            return None
+        return str(record.get("status") or "active").lower()
+
+    def set_channel_status(self, name: str, status: str) -> bool:
+        normalized = str(status or "").strip().lower()
+        if normalized not in {"active", "paused", "blocked"}:
+            return False
+        with self._tx() as cursor:
+            cursor.execute(
+                "UPDATE channels SET status = ? WHERE name = ?",
+                (normalized, name),
+            )
+            return cursor.rowcount > 0
+
     def get_signed_channels(self) -> List[Dict[str, Any]]:
         """Operator-approved channels, i.e. the ones that can be federated."""
         with self._tx() as cursor:
-            cursor.execute("SELECT * FROM channels WHERE signature IS NOT NULL ORDER BY name ASC")
+            cursor.execute(
+                "SELECT * FROM channels "
+                "WHERE signature IS NOT NULL AND COALESCE(status, 'active') = 'active' "
+                "ORDER BY name ASC"
+            )
             return [dict(row) for row in cursor.fetchall()]
 
     def sign_and_add_channel(self, identity: RNS.Identity, name: str,
@@ -1554,13 +1584,14 @@ class SpeakeasyDB(CalendarStore):
 
         with self._tx() as cursor:
             cursor.execute("""
-                INSERT INTO channels (name, description, created_at, approver_hash, signature)
-                VALUES (?, ?, ?, ?, ?)
+                INSERT INTO channels (name, description, created_at, approver_hash, signature, status)
+                VALUES (?, ?, ?, ?, ?, 'active')
                 ON CONFLICT(name) DO UPDATE SET
                     description = excluded.description,
                     created_at = excluded.created_at,
                     approver_hash = excluded.approver_hash,
-                    signature = excluded.signature
+                    signature = excluded.signature,
+                    status = 'active'
             """, (name, description, created_at, approver_hash, sig))
 
         return {
@@ -1600,13 +1631,14 @@ class SpeakeasyDB(CalendarStore):
 
         with self._tx() as cursor:
             cursor.execute("""
-                INSERT INTO channels (name, description, created_at, approver_hash, signature)
-                VALUES (?, ?, ?, ?, ?)
+                INSERT INTO channels (name, description, created_at, approver_hash, signature, status)
+                VALUES (?, ?, ?, ?, ?, 'active')
                 ON CONFLICT(name) DO UPDATE SET
                     description = excluded.description,
                     created_at = excluded.created_at,
                     approver_hash = excluded.approver_hash,
-                    signature = excluded.signature
+                    signature = excluded.signature,
+                    status = 'active'
             """, (name, description, created_at, approver_hash, signature))
         return True
 
@@ -1655,13 +1687,16 @@ class SpeakeasyDB(CalendarStore):
         """Returns a list of channel name strings for protocol sync frames."""
         return [ch["name"] for ch in self.get_channels()]
 
-    def add_channel(self, name: str, description: str = "") -> bool:
+    def add_channel(self, name: str, description: str = "", status: str = "active") -> bool:
+        normalized = str(status or "active").strip().lower()
+        if normalized not in {"active", "paused", "blocked"}:
+            normalized = "active"
         with self._tx() as cursor:
             try:
                 cursor.execute("""
-                    INSERT INTO channels (name, description, created_at)
-                    VALUES (?, ?, ?)
-                """, (name, description, time.time()))
+                    INSERT INTO channels (name, description, created_at, status)
+                    VALUES (?, ?, ?, ?)
+                """, (name, description, time.time(), normalized))
                 return True
             except sqlite3.IntegrityError:
                 return False

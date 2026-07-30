@@ -183,6 +183,16 @@ def test_channel_requests_are_ignored_when_not_accepted(tmp_path, bob):
         node.close()
 
 
+def test_channel_requests_are_ignored_for_blocked_channels(hub, bob):
+    hub.db.add_channel("spam", "blocked", status="blocked")
+    hub.engine.channel_blocklist.add("spam")
+
+    result = hub.deliver(bob.engine.build_channel_req("spam", "let me in"))
+
+    assert result.channel_requests == []
+    assert hub.db.get_channel_requests("pending") == []
+
+
 def test_duplicate_channel_requests_do_not_stack(hub, bob):
     hub.deliver(bob.engine.build_channel_req("lounge", "first"))
     result = hub.deliver(bob.engine.build_channel_req("lounge", "again"))
@@ -240,6 +250,21 @@ def test_approved_channel_carries_traffic_despite_static_policy(tmp_path, hub):
         assert peer.engine.channel_permitted("lounge")
         result = peer.deliver(hub.engine.build_delta_push_chunks([message])[0])
         assert result.accepted_msg_ids == [message["msg_id"]]
+    finally:
+        peer.close()
+
+
+def test_paused_channel_refuses_traffic(tmp_path, hub):
+    peer = Node(tmp_path / "paused.db", allowed_channels={"parlor"})
+    author = RNS.Identity()
+    try:
+        peer.db.set_channel_status("parlor", "paused")
+        peer.db.upsert_identity(author.hash.hex(), "alice", author.get_public_key())
+        message = hub.db.sign_and_insert_message(author, "parlor", "maintenance window")
+
+        assert not peer.engine.channel_permitted("parlor")
+        result = peer.deliver(hub.engine.build_delta_push_chunks([message])[0])
+        assert result.accepted_msg_ids == []
     finally:
         peer.close()
 

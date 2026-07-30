@@ -151,6 +151,9 @@ class S2SProtocolEngine:
     def channel_permitted(self, channel: str) -> bool:
         if channel in self.channel_blocklist:
             return False
+        status = self.db.get_channel_status(channel)
+        if status in {"paused", "blocked"}:
+            return False
         if self.allowed_channels is None or channel in self.allowed_channels:
             return True
         # A channel an operator approved and federated is as valid as one named
@@ -510,6 +513,8 @@ class S2SProtocolEngine:
                 return result
             if not self.accept_channel_requests:
                 logger.info(f"Ignored channel request for #{chan_name}: this node does not take requests")
+            elif self.db.get_channel_status(chan_name) == "blocked":
+                logger.info(f"Ignored channel request for #{chan_name}: channel is blocked")
             elif chan_name in self.channel_blocklist:
                 logger.info(f"Ignored channel request for #{chan_name}: blocklisted")
             elif self.db.add_channel_request(chan_name, desc, origin_hash.hex()):

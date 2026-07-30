@@ -127,8 +127,16 @@ class SpeakeasyDaemon:
                                   MAX_MESSAGE_CONTENT_BYTES),
         )
         for channel in sorted(self.allowed_channels):
-            if channel not in self.channel_blocklist:
-                self.db.add_channel(channel, f"Configured channel #{channel}")
+            if channel in self.channel_blocklist:
+                self.db.add_channel(channel, f"Configured channel #{channel}", status="blocked")
+            else:
+                self.db.add_channel(channel, f"Configured channel #{channel}", status="active")
+
+        self.allowed_channels = set(self.db.get_active_channel_names())
+        self.channel_blocklist.update(
+            c["name"] for c in self.db.get_channels()
+            if str(c.get("status") or "active").lower() == "blocked"
+        )
 
         self.rns = RNS.Reticulum()
 
@@ -163,6 +171,7 @@ class SpeakeasyDaemon:
             accept_channel_requests=self.accept_channel_requests,
             sync_history_days=self.sync_history_days,
         )
+        self._rebuild_channel_policy()
 
         # 5. Peer discovery & operator control
         if self.auto_discover_peers:
@@ -250,9 +259,21 @@ class SpeakeasyDaemon:
         logger.info(f"Link established with [{remote_hash}]")
         self.announce_host()
 
-        hello_frame = self.s2s_engine.build_hello(self.db.get_channel_names())
+        hello_frame = self.s2s_engine.build_hello(self.db.get_active_channel_names())
         RNS.Packet(link, hello_frame).send()
         self._bootstrap_link(link)
+
+    def _rebuild_channel_policy(self):
+        """Aligns runtime policy with persisted channel lifecycle state."""
+        self.allowed_channels = set(self.db.get_active_channel_names())
+        blocked = {
+            c["name"] for c in self.db.get_channels()
+            if str(c.get("status") or "active").lower() == "blocked"
+        }
+        self.channel_blocklist.update(blocked)
+        if hasattr(self, "s2s_engine") and self.s2s_engine:
+            self.s2s_engine.allowed_channels = self.allowed_channels or None
+            self.s2s_engine.channel_blocklist = set(self.channel_blocklist)
 
     def _bootstrap_link(self, link):
         """
@@ -383,12 +404,53 @@ class SpeakeasyDaemon:
             return f"Could not approve #{name}."
 
         self.db.set_channel_request_status(name, "approved")
-        self.allowed_channels.add(name)
-        self.s2s_engine.allowed_channels = self.allowed_channels or None
+        self.db.set_channel_status(name, "active")
+        self.channel_blocklist.discard(name)
+        self._rebuild_channel_policy()
 
         peers = self._broadcast(self.s2s_engine.build_channel_frames([name]))
         logger.info(f"Approved channel #{name}; propagated to {peers} peer link(s).")
         return f"Approved #{name} and propagated it to {peers} connected peer(s)."
+
+    def add_channel(self, name: str, description: str = "") -> str:
+        clean = str(name or "").lstrip("#").strip()
+        if not clean:
+            return "Usage: add <channel> [description]"
+        if not self.db.get_channel(clean):
+            self.db.add_channel(clean, description or f"Channel #{clean}", status="active")
+        record = self.db.sign_and_add_channel(self.identity, clean, description or f"Channel #{clean}")
+        if not record:
+            return f"Could not add #{clean}."
+        self.db.set_channel_status(clean, "active")
+        self.channel_blocklist.discard(clean)
+        self._rebuild_channel_policy()
+        peers = self._broadcast(self.s2s_engine.build_channel_frames([clean]))
+        return f"Added #{clean} and propagated it to {peers} connected peer(s)."
+
+    def pause_channel(self, name: str) -> str:
+        clean = str(name or "").lstrip("#").strip()
+        if not self.db.set_channel_status(clean, "paused"):
+            return f"Unknown channel #{clean}."
+        self._rebuild_channel_policy()
+        return f"Paused #{clean}; traffic is now refused."
+
+    def resume_channel(self, name: str) -> str:
+        clean = str(name or "").lstrip("#").strip()
+        if not self.db.set_channel_status(clean, "active"):
+            return f"Unknown channel #{clean}."
+        self.channel_blocklist.discard(clean)
+        self._rebuild_channel_policy()
+        if self.db.get_channel(clean).get("signature"):
+            self._broadcast(self.s2s_engine.build_channel_frames([clean]))
+        return f"Resumed #{clean}."
+
+    def block_channel(self, name: str) -> str:
+        clean = str(name or "").lstrip("#").strip()
+        if not self.db.set_channel_status(clean, "blocked"):
+            return f"Unknown channel #{clean}."
+        self.channel_blocklist.add(clean)
+        self._rebuild_channel_policy()
+        return f"Blocked #{clean}; requests and traffic are refused."
 
     def deny_channel(self, name: str) -> str:
         if self.db.set_channel_request_status(name, "denied"):
@@ -401,6 +463,15 @@ class SpeakeasyDaemon:
             return self.approve_channel(argument.lstrip("#"))
         if command == "deny" and argument:
             return self.deny_channel(argument.lstrip("#"))
+        if command == "add" and argument:
+            chan, _, desc = argument.partition(" ")
+            return self.add_channel(chan, desc.strip())
+        if command == "pause" and argument:
+            return self.pause_channel(argument)
+        if command == "resume" and argument:
+            return self.resume_channel(argument)
+        if command == "block" and argument:
+            return self.block_channel(argument)
         if command == "pending":
             requests = self.db.get_channel_requests("pending")
             if not requests:
@@ -409,7 +480,13 @@ class SpeakeasyDaemon:
                 f"#{r['name']} - {r['description'] or '(no description)'}" for r in requests
             )
         if command == "channels":
-            return "Channels: " + ", ".join(f"#{c}" for c in self.db.get_channel_names())
+            channels = self.db.get_channels()
+            if not channels:
+                return "No channels configured."
+            return "Channels:\n" + "\n".join(
+                f"#{c['name']} [{str(c.get('status') or 'active').lower()}]"
+                for c in channels
+            )
         return ""
 
     # ------------------------------------------------------------------
@@ -472,8 +549,7 @@ class SpeakeasyDaemon:
             return
 
         self.propagated_channels.update(fresh)
-        self.allowed_channels.update(fresh)
-        self.s2s_engine.allowed_channels = self.allowed_channels or None
+        self._rebuild_channel_policy()
         peers = self._broadcast(self.s2s_engine.build_channel_frames(fresh))
         logger.info(f"Propagated {len(fresh)} approved channel(s) to {peers} peer link(s).")
 
@@ -566,7 +642,7 @@ class SpeakeasyDaemon:
         retention window and wraps around, so backfill completes over a few
         rounds instead of flooding one link with the entire archive.
         """
-        channels = self.db.get_channel_names()
+        channels = self.db.get_active_channel_names()
         frame = self.s2s_engine.build_sync_request(channels, offset=self.sync_offset)
         if not frame:
             return
