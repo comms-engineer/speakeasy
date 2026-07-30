@@ -816,6 +816,17 @@ class SpeakeasyDB(CalendarStore):
                 )
             """)
 
+            # Client-side channel visibility preferences scoped to a host.
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS client_channel_prefs (
+                    host_hash TEXT,
+                    channel_name TEXT,
+                    visible INTEGER,
+                    updated_at REAL,
+                    PRIMARY KEY (host_hash, channel_name)
+                )
+            """)
+
             # Epoch sync scans messages by (channel, timestamp) range on every
             # anti-entropy round; the bulletin index backs the board view.
             cursor.execute("CREATE INDEX IF NOT EXISTS idx_messages_channel_ts ON messages (channel, timestamp)")
@@ -1469,6 +1480,47 @@ class SpeakeasyDB(CalendarStore):
     # ----------------------------------------------------------------------
     # Channel Management
     # ----------------------------------------------------------------------
+
+    def set_channel_visibility(self, host_hash: str, channel_name: str, visible: bool) -> bool:
+        host_key = (host_hash or "").strip().lower()
+        chan = str(channel_name or "").lstrip("#").strip()
+        if not host_key or not chan:
+            return False
+        with self._tx() as cursor:
+            cursor.execute("""
+                INSERT INTO client_channel_prefs (host_hash, channel_name, visible, updated_at)
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(host_hash, channel_name) DO UPDATE SET
+                    visible = excluded.visible,
+                    updated_at = excluded.updated_at
+            """, (host_key, chan, int(bool(visible)), time.time()))
+        return True
+
+    def get_channel_visibility_map(self, host_hash: str) -> Dict[str, bool]:
+        host_key = (host_hash or "").strip().lower()
+        if not host_key:
+            return {}
+        with self._tx() as cursor:
+            cursor.execute(
+                "SELECT channel_name, visible FROM client_channel_prefs WHERE host_hash = ?",
+                (host_key,),
+            )
+            return {
+                str(row[0]).lstrip("#"): bool(row[1])
+                for row in cursor.fetchall()
+            }
+
+    def get_visible_channels(self, host_hash: str, channel_names: Iterable[str],
+                             default_visible: bool = True) -> List[str]:
+        prefs = self.get_channel_visibility_map(host_hash)
+        visible = []
+        for raw in channel_names:
+            chan = str(raw or "").lstrip("#").strip()
+            if not chan:
+                continue
+            if prefs.get(chan, default_visible):
+                visible.append(chan)
+        return visible
 
     def get_channels(self) -> List[Dict[str, Any]]:
         """Returns all channel records as dictionaries for UI composition."""

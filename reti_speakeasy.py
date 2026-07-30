@@ -290,6 +290,94 @@ class ChannelRequestModal(ModalScreen[dict]):
             self.dismiss(None)
 
 
+class ChannelManagerModal(ModalScreen[dict]):
+    BINDINGS = [
+        ("escape", "dismiss_modal", "Cancel / Close")
+    ]
+
+    CSS = """
+    ChannelManagerModal {
+        align: center middle;
+        background: rgba(0, 0, 0, 0.85);
+    }
+    #dialog {
+        padding: 1 2;
+        width: 70;
+        height: auto;
+        max-height: 90%;
+        border: thick $accent;
+        background: $surface;
+        layout: vertical;
+    }
+    #channel-table {
+        height: 12;
+        margin-bottom: 1;
+    }
+    #button-row {
+        height: 3;
+        align: center middle;
+    }
+    Button {
+        margin: 0 1;
+    }
+    """
+
+    def __init__(self, host_label: str, channels: list[str], visibility: dict[str, bool]):
+        super().__init__()
+        self.host_label = host_label
+        self.channels = [str(c).lstrip("#") for c in channels if str(c).strip()]
+        self.visibility = {
+            str(ch).lstrip("#"): bool(v)
+            for ch, v in visibility.items()
+        }
+        self.selected_channel = self.channels[0] if self.channels else None
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="dialog"):
+            yield Label(f" Channel Visibility for [{self.host_label[:10]}]", id="modal-title")
+            yield DataTable(id="channel-table")
+            with Horizontal(id="button-row"):
+                yield Button("Toggle Selected", variant="primary", id="btn-toggle")
+                yield Button("Save", variant="success", id="btn-save")
+                yield Button("Cancel [Esc]", variant="error", id="btn-cancel")
+
+    def action_dismiss_modal(self) -> None:
+        self.dismiss(None)
+
+    def on_mount(self) -> None:
+        table = self.query_one("#channel-table", DataTable)
+        table.cursor_type = "row"
+        table.add_columns("Channel", "Visible")
+        self.refresh_table()
+
+    def refresh_table(self) -> None:
+        table = self.query_one("#channel-table", DataTable)
+        table.clear()
+        for channel in sorted(self.channels):
+            visible = self.visibility.get(channel, True)
+            table.add_row(f"#{channel}", "yes" if visible else "no", key=channel)
+
+    def on_data_table_row_selected(self, event: DataTable.RowSelected) -> None:
+        if event.data_table.id == "channel-table":
+            self.selected_channel = str(event.row_key.value)
+
+    def _toggle_selected(self) -> None:
+        if not self.selected_channel:
+            return
+        current = self.visibility.get(self.selected_channel, True)
+        self.visibility[self.selected_channel] = not current
+        self.refresh_table()
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        if event.button.id == "btn-toggle":
+            self._toggle_selected()
+            return
+        if event.button.id == "btn-save":
+            self.dismiss(self.visibility)
+            return
+        self.dismiss(None)
+
+
 class BulletinPostModal(ModalScreen[dict]):
     BINDINGS = [("escape", "dismiss_modal", "Cancel / Close")]
 
@@ -875,6 +963,7 @@ class RetiSpeakeasyApp(App):
         ("p", "show_profile_modal", "Edit Profile"),
         ("b", "show_bulletin_modal", "New Bulletin"),
         ("n", "show_channel_request_modal", "Request Channel"),
+        ("m", "show_channel_manager_modal", "Manage Channels"),
         ("c", "show_calendar_modal", "Calendar Event"),
     ]
 
@@ -896,6 +985,7 @@ class RetiSpeakeasyApp(App):
                 yield Button(" Edit Profile (P)", id="btn-profile-open", classes="sidebar-btn", variant="default")
                 yield Button(" New Bulletin (B)", id="btn-bulletin-open", classes="sidebar-btn", variant="success")
                 yield Button(" Request Channel (N)", id="btn-channel-open", classes="sidebar-btn", variant="warning")
+                yield Button(" Manage Channels (M)", id="btn-channel-manage", classes="sidebar-btn", variant="primary")
                 yield Button(" New Calendar Event (C)", id="btn-calendar-open", classes="sidebar-btn", variant="primary")
                 yield Label(" System Log", classes="widget-header")
                 yield RichLog(id="system-log", classes="chat-log", highlight=True, markup=True)
@@ -1027,37 +1117,91 @@ class RetiSpeakeasyApp(App):
         self.push_screen(ProfileModal(current_profile=profile), handle_profile)
 
     def sync_channel_tabs(self, channel_names) -> None:
-        """Adds a tab for every channel the host carries that is not shown yet."""
+        """Shows only channels carried by the host and enabled in local prefs."""
         tabs = self.query_one("#channel-tabs", TabbedContent)
+        host_key = (self.engine.current_host_hash or "").lower()
+        available = []
         for name in channel_names:
             clean_id = str(name).lstrip("#")
             if not clean_id:
                 continue
+            available.append(clean_id)
+            self.engine.db.add_channel(clean_id, f"Channel #{clean_id}")
+
+        visible = set(self.engine.db.get_visible_channels(host_key, available, default_visible=True))
+
+        for name in available:
+            clean_id = str(name).lstrip("#")
             try:
-                self.query_one(f"#log-{clean_id}", RichLog)
-                continue
+                pane = self.query_one(f"#tab-{clean_id}", TabPane)
+            except Exception:
+                pane = None
+
+            if pane is None:
+                tabs.add_pane(TabPane(
+                    f"#{clean_id}",
+                    RichLog(id=f"log-{clean_id}", classes="chat-log", highlight=True, markup=True),
+                    Vertical(
+                        Vertical(
+                            Label(f" {clean_id} Calendar", classes="widget-header"),
+                            Horizontal(classes="channel-calendar-controls")(
+                                Button(" New", id=f"btn-calendar-new-{clean_id}", variant="success"),
+                                Button(" Edit", id=f"btn-calendar-edit-{clean_id}", variant="primary"),
+                                Button(" Delete", id=f"btn-calendar-delete-{clean_id}", variant="error"),
+                            ),
+                            DataTable(id=f"calendar-table-{clean_id}"),
+                            RichLog(id=f"calendar-log-{clean_id}", classes="chat-log", highlight=True, markup=True),
+                            id=f"calendar-pane-{clean_id}",
+                        ),
+                    ),
+                    id=f"tab-{clean_id}",
+                ))
+
+            try:
+                pane = self.query_one(f"#tab-{clean_id}", TabPane)
+                pane.display = clean_id in visible
             except Exception:
                 pass
-            self.engine.db.add_channel(clean_id, f"Channel #{clean_id}")
-            tabs.add_pane(TabPane(
-                f"#{clean_id}",
-                RichLog(id=f"log-{clean_id}", classes="chat-log", highlight=True, markup=True),
-                Vertical(
-                    Vertical(
-                        Label(f" {clean_id} Calendar", classes="widget-header"),
-                        Horizontal(classes="channel-calendar-controls")(
-                            Button(" New", id=f"btn-calendar-new-{clean_id}", variant="success"),
-                            Button(" Edit", id=f"btn-calendar-edit-{clean_id}", variant="primary"),
-                            Button(" Delete", id=f"btn-calendar-delete-{clean_id}", variant="error"),
-                        ),
-                        DataTable(id=f"calendar-table-{clean_id}"),
-                        RichLog(id=f"calendar-log-{clean_id}", classes="chat-log", highlight=True, markup=True),
-                        id=f"calendar-pane-{clean_id}",
-                    ),
-                ),
-                id=f"tab-{clean_id}",
-            ))
+
+        # Hide any channel tabs not currently carried by this host.
+        for pane in self.query("TabPane"):
+            pane_id = getattr(pane, "id", "") or ""
+            if not pane_id.startswith("tab-") or pane_id == "tab-bbs":
+                continue
+            channel = pane_id.replace("tab-", "", 1)
+            if channel not in set(available):
+                pane.display = False
+
+        if tabs.active:
+            active_channel = tabs.active.replace("tab-", "").lstrip("#")
+            if active_channel and active_channel != "bbs" and active_channel not in visible:
+                fallback = "general" if "general" in visible else (sorted(visible)[0] if visible else "bbs")
+                tabs.active = f"tab-{fallback}" if fallback != "bbs" else "tab-bbs"
         self.reload_all_chat_logs()
+
+    def action_show_channel_manager_modal(self) -> None:
+        host_key = (self.engine.current_host_hash or "").lower()
+        if not host_key:
+            self.notify("Connect to a host first.", severity="warning")
+            return
+
+        channels = sorted(str(c).lstrip("#") for c in self.engine.host_channels if str(c).strip())
+        if not channels:
+            self.notify("No channels advertised by the host yet.", severity="warning")
+            return
+
+        prefs = self.engine.db.get_channel_visibility_map(host_key)
+        visibility = {channel: prefs.get(channel, True) for channel in channels}
+
+        def handle_visibility(data: dict | None) -> None:
+            if not data:
+                return
+            for channel, visible in data.items():
+                self.engine.db.set_channel_visibility(host_key, channel, bool(visible))
+            self.sync_channel_tabs(sorted(self.engine.host_channels))
+
+        self.push_screen(ChannelManagerModal(host_label=host_key, channels=channels, visibility=visibility),
+                         handle_visibility)
 
     def action_show_channel_request_modal(self) -> None:
         def handle_request(data: dict | None) -> None:
@@ -1194,6 +1338,8 @@ class RetiSpeakeasyApp(App):
             self.action_show_bulletin_modal()
         elif event.button.id == "btn-channel-open":
             self.action_show_channel_request_modal()
+        elif event.button.id == "btn-channel-manage":
+            self.action_show_channel_manager_modal()
         elif event.button.id == "btn-calendar-open":
             self.action_show_calendar_modal()
         elif event.button.id.startswith("btn-calendar-new-"):

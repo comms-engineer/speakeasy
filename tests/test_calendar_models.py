@@ -109,6 +109,42 @@ def test_channel_tabs_have_their_own_calendar_panels(tmp_path):
     asyncio.run(check_components())
 
 
+def test_channel_visibility_hides_host_tab(tmp_path):
+    app = RetiSpeakeasyApp()
+    db_path = tmp_path / "client-visible.db"
+    host_hash = "ab" * 16
+
+    def fake_engine_init(self, ui_callback=None):
+        self.ui_callback = ui_callback
+        self.hash_str = "test-hash"
+        self.db = SpeakeasyDB(str(db_path))
+        self.identity = SimpleNamespace(hash=SimpleNamespace(hex=lambda: "test-identity"))
+        self.host_manager = None
+        self.active_host_link = None
+        self.s2s_engine = None
+        self.host_channels = {"general", "tech"}
+        self.current_host_hash = host_hash
+
+    async def check_visibility() -> None:
+        with patch("reti_speakeasy.ReticulumEngine.__init__", fake_engine_init), \
+             patch("reti_speakeasy.client_db_path", return_value=str(db_path)):
+            startup_db = SpeakeasyDB(str(db_path))
+            startup_db.add_channel("general", "Channel #general")
+            startup_db.add_channel("tech", "Channel #tech")
+            startup_db.set_channel_visibility(host_hash, "tech", False)
+            startup_db.close()
+
+            async with app.run_test():
+                app.sync_channel_tabs(["general", "tech"])
+                general_tab = app.query_one("#tab-general")
+                tech_tab = app.query_one("#tab-tech")
+                assert bool(general_tab.display) is True
+                assert bool(tech_tab.display) is False
+
+    import asyncio
+    asyncio.run(check_visibility())
+
+
 def test_calendar_and_event_models_round_trip():
     calendar = Calendar(
         calendar_id="cal-001",
