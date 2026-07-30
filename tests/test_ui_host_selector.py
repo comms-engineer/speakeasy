@@ -1,7 +1,12 @@
 import sqlite3
+import time
 from types import SimpleNamespace
+
+import msgpack
+import RNS
+
 from channel_summary import build_channel_summary
-from reti_speakeasy import HostSelectorModal, HostManager, RetiSpeakeasyApp
+from reti_speakeasy import HostSelectorModal, HostManager, RetiSpeakeasyApp, ReticulumEngine
 
 
 def test_host_selector_populates_table(monkeypatch):
@@ -13,7 +18,7 @@ def test_host_selector_populates_table(monkeypatch):
         "hops": 2,
         "load": 0,
         "max_load": 10,
-        "last_seen": 1620000000.0,
+        "last_seen": time.time(),
         "is_manual": False,
         "score": 10.0,
         "hash_bytes": bytes.fromhex("dd" * 16),
@@ -24,7 +29,7 @@ def test_host_selector_populates_table(monkeypatch):
         "hops": 5,
         "load": 3,
         "max_load": 10,
-        "last_seen": 1620000300.0,
+        "last_seen": time.time(),
         "is_manual": True,
         "score": 5.0,
         "hash_bytes": bytes.fromhex("ee" * 16),
@@ -122,6 +127,34 @@ def test_action_quit_is_resilient_to_engine_shutdown_errors(monkeypatch):
     monkeypatch.setattr(app, "exit", lambda: None)
 
     app.action_quit()
+
+
+def test_host_manager_ignores_ignored_hashes_on_announce():
+    local_identity = RNS.Identity()
+    hm = HostManager(
+        db=None,
+        probe_interval=300,
+        probes_per_round=1,
+        ignored_hashes={local_identity.hash},
+    )
+    payload = msgpack.packb({"name": "Local Hub", "load": 1, "max_load": 50}, use_bin_type=True)
+
+    hm.update_from_announce(local_identity.hash, local_identity, payload)
+
+    assert hm.hosts == {}
+
+
+def test_reticulum_engine_emits_diagnostics():
+    captured = []
+
+    class FakeUI:
+        def __call__(self, event_type, data):
+            captured.append((event_type, data))
+
+    engine = ReticulumEngine(ui_callback=FakeUI())
+    engine._record_transport_diagnostic("Path request failed")
+
+    assert captured[-1] == ("diagnostic", "Path request failed")
 
 
 def test_host_selector_channel_filter_uses_summary():

@@ -94,20 +94,30 @@ def calculate_host_score(hops: int, load: int, max_load: int, last_seen: float) 
 
 
 class HostManager:
-    def __init__(self, db: Optional[SpeakeasyDB] = None, probe_interval: int = 30, probes_per_round: int = 6):
+    def __init__(self, db: Optional[SpeakeasyDB] = None, probe_interval: int = 30, probes_per_round: int = 6, ignored_hashes: Optional[set] = None):
         self.hosts = {}
         self.db = db
         self.probe_interval = int(probe_interval)
         self.probes_per_round = int(probes_per_round)
         self._prober_thread = None
         self._stop_prober = threading.Event()
+        self.ignored_hashes = {self._coerce_hash(h) for h in (ignored_hashes or set()) if self._coerce_hash(h) is not None}
+        self.stale_after_seconds = 7200
 
         # Load cached hosts from DB if available
         if self.db:
             try:
+                now = time.time()
                 for h in self.db.load_hosts(limit=500):
+                    if self._is_stale_host(h, now=now):
+                        continue
+                    hash_bytes = self._coerce_hash(h.get("hex_hash"))
+                    if hash_bytes is not None and hash_bytes in self.ignored_hashes:
+                        continue
                     # ensure hash_bytes present
-                    if not h.get("hash_bytes") and h.get("hex_hash"):
+                    if not h.get("hash_bytes") and hash_bytes is not None:
+                        h["hash_bytes"] = hash_bytes
+                    elif not h.get("hash_bytes") and h.get("hex_hash"):
                         try:
                             h["hash_bytes"] = bytes.fromhex(h["hex_hash"]) if h.get("hex_hash") else None
                         except Exception:
@@ -187,8 +197,45 @@ class HostManager:
                 # Don't crash the prober thread on unexpected errors
                 time.sleep(max(1, self.probe_interval))
 
+    @staticmethod
+    def _coerce_hash(value) -> bytes | None:
+        if value is None:
+            return None
+        if isinstance(value, bytes):
+            return value
+        if isinstance(value, str):
+            try:
+                return bytes.fromhex(value)
+            except ValueError:
+                return None
+        return None
+
+    def _is_stale_host(self, host: dict, now: float | None = None) -> bool:
+        if not host:
+            return True
+        if bool(host.get("is_manual")):
+            return False
+        last_seen = host.get("last_seen")
+        if last_seen is None:
+            return False
+        try:
+            last_seen_value = float(last_seen)
+        except (TypeError, ValueError):
+            return False
+        if now is None:
+            now = time.time()
+        return (now - last_seen_value) > self.stale_after_seconds
+
     def update_from_announce(self, destination_hash: bytes, announced_identity: RNS.Identity, app_data: bytes):
-        hex_hash = destination_hash.hex()
+        destination_bytes = self._coerce_hash(destination_hash)
+        if destination_bytes is None:
+            return
+        if destination_bytes in self.ignored_hashes:
+            return
+        if announced_identity is not None and self._coerce_hash(getattr(announced_identity, "hash", None)) in self.ignored_hashes:
+            return
+
+        hex_hash = destination_bytes.hex()
 
         metadata = {}
         if app_data:
@@ -198,7 +245,7 @@ class HostManager:
                 pass
 
         host = {
-            "hash_bytes": destination_hash,
+            "hash_bytes": destination_bytes,
             "hex_hash": hex_hash,
             "identity": announced_identity,
             "alias": metadata.get("name", f"Host-{hex_hash[:6]}"),
@@ -267,9 +314,11 @@ class HostManager:
             except Exception:
                 local_channels = set()
         for host in list(self.hosts.values()):
-            # Keep previously discovered hosts visible to the UI and the caller.
-            # Stale-host cleanup is handled by the DB layer separately so this
-            # list remains useful for manual inspection and selection.
+            if self._is_stale_host(host, now=now):
+                continue
+            host_hash = self._coerce_hash(host.get("hex_hash"))
+            if host_hash is not None and host_hash in self.ignored_hashes:
+                continue
             host["score"] = calculate_host_score(
                 host.get("hops", 99),
                 host.get("load", 0),
@@ -903,6 +952,7 @@ class ReticulumEngine:
         self.auto_failover_enabled = True
         self._stopped = False
         self._connect_thread = None
+        self._diagnostics = []
         # Channels the connected host advertised in its FED_HELLO. Anything
         # outside this set is dropped by the hub, so the client must not
         # pretend a message to it was delivered.
@@ -929,6 +979,7 @@ class ReticulumEngine:
 
         # Host manager now backed by DB and with a background prober.
         self.host_manager = HostManager(db=self.db, probe_interval=30, probes_per_round=6)
+        self.host_manager.ignored_hashes.add(self.identity.hash)
         self.discovery_handler = SpeakeasyHostDiscoveryHandler(self.host_manager)
         RNS.Transport.register_announce_handler(self.discovery_handler)
 
@@ -943,6 +994,7 @@ class ReticulumEngine:
             local_hash_bytes=self.identity.hash,
             bandwidth_class=BandwidthClass.MEDIUM_MESH
         )
+        self._install_transport_diagnostics()
 
     def _notify_ui(self, event_type: str, data=None):
         if self._stopped or not self.ui_callback:
@@ -955,6 +1007,76 @@ class ReticulumEngine:
         except Exception:
             pass
 
+    def _install_transport_diagnostics(self):
+        if getattr(self, "_transport_diagnostics_installed", False):
+            return
+
+        self._transport_diagnostics_installed = True
+
+        self._orig_request_path = getattr(RNS.Transport, "request_path", None)
+        self._orig_mark_path_unresponsive = getattr(RNS.Transport, "mark_path_unresponsive", None)
+        self._orig_mark_path_unknown_state = getattr(RNS.Transport, "mark_path_unknown_state", None)
+        self._orig_remove_interface = getattr(RNS.Transport, "remove_interface", None)
+
+        def request_path_wrapper(dest, *args, **kwargs):
+            label = self._format_dest_label(dest)
+            self._record_transport_diagnostic(f"Requesting path for [{label}]")
+            try:
+                return self._orig_request_path(dest, *args, **kwargs)
+            except Exception as exc:
+                self._handle_transport_exception(f"path request for [{label}]", exc)
+                raise
+
+        def mark_path_unresponsive_wrapper(dest, *args, **kwargs):
+            label = self._format_dest_label(dest)
+            self._record_transport_diagnostic(f"Path marked unresponsive for [{label}]")
+            if self._orig_mark_path_unresponsive is None:
+                return None
+            return self._orig_mark_path_unresponsive(dest, *args, **kwargs)
+
+        def mark_path_unknown_state_wrapper(dest, *args, **kwargs):
+            label = self._format_dest_label(dest)
+            self._record_transport_diagnostic(f"Path state unknown for [{label}]")
+            if self._orig_mark_path_unknown_state is None:
+                return None
+            return self._orig_mark_path_unknown_state(dest, *args, **kwargs)
+
+        def remove_interface_wrapper(interface, *args, **kwargs):
+            iface_name = getattr(interface, "name", repr(interface))
+            self._record_transport_diagnostic(f"Reticulum interface dropped: {iface_name}")
+            if self._orig_remove_interface is None:
+                return None
+            return self._orig_remove_interface(interface, *args, **kwargs)
+
+        if self._orig_request_path is not None:
+            RNS.Transport.request_path = request_path_wrapper
+        if self._orig_mark_path_unresponsive is not None:
+            RNS.Transport.mark_path_unresponsive = mark_path_unresponsive_wrapper
+        if self._orig_mark_path_unknown_state is not None:
+            RNS.Transport.mark_path_unknown_state = mark_path_unknown_state_wrapper
+        if self._orig_remove_interface is not None:
+            RNS.Transport.remove_interface = remove_interface_wrapper
+
+    def _format_dest_label(self, dest) -> str:
+        if isinstance(dest, bytes):
+            return RNS.prettyhexrep(dest)[:10]
+        if isinstance(dest, str):
+            return dest[:10]
+        return "unknown"
+
+    def _record_transport_diagnostic(self, message: str):
+        clean_message = str(message).strip()
+        if not clean_message:
+            return
+        self._diagnostics.append(clean_message)
+        self._notify_ui("diagnostic", clean_message)
+
+    def _handle_transport_exception(self, context: str, exc: Exception | None = None):
+        message = f"Reticulum {context}"
+        if exc is not None:
+            message = f"{message}: {exc}"
+        self._record_transport_diagnostic(message)
+
     def connect_to_host(self, hash_hex: str, is_failover: bool = False):
         def _connect_worker():
             if self._stopped:
@@ -965,8 +1087,14 @@ class ReticulumEngine:
 
                 if not RNS.Transport.has_path(dest_bytes):
                     self._notify_ui("system", f"Requesting path for host [{clean_hex[:10]}]...")
-                    RNS.Transport.request_path(dest_bytes)
+                    try:
+                        RNS.Transport.request_path(dest_bytes)
+                    except Exception as exc:
+                        self._handle_transport_exception(f"path request for [{clean_hex[:10]}]", exc)
+                        raise
                     time.sleep(0.5)
+                    if not RNS.Transport.has_path(dest_bytes):
+                        self._record_transport_diagnostic(f"Reticulum reported no usable path for [{clean_hex[:10]}]")
 
                 identity = RNS.Identity.recall(dest_bytes)
                 if not identity:
@@ -980,20 +1108,27 @@ class ReticulumEngine:
                     self._notify_ui("system", f"{prefix}: Establishing link to host [{clean_hex[:10]}]...")
                     time.sleep(0.35)
 
-                    target_dest = RNS.Destination(identity, RNS.Destination.OUT, RNS.Destination.SINGLE, APP_NAME, ASPECT_HOST)
-                    link = RNS.Link(target_dest)
+                    try:
+                        target_dest = RNS.Destination(identity, RNS.Destination.OUT, RNS.Destination.SINGLE, APP_NAME, ASPECT_HOST)
+                        link = RNS.Link(target_dest)
+                    except Exception as exc:
+                        self._handle_transport_exception(f"link establishment for [{clean_hex[:10]}]", exc)
+                        raise
+
                     link.set_link_established_callback(self._on_link_established)
                     link.set_link_closed_callback(self._on_link_closed)
                     link.set_packet_callback(self._on_packet_received)
 
                     self.current_host_hash = clean_hex
                 else:
+                    self._record_transport_diagnostic(f"Reticulum could not resolve identity for [{clean_hex[:10]}]")
                     self._notify_ui("system", f"[bold red]Error:[/] Identity unknown for host [{clean_hex[:10]}].")
                     if is_failover:
                         self.trigger_auto_failover(exclude_hash=clean_hex)
 
             except Exception as e:
                 self._notify_ui("system", f"[bold red]Connection Error:[/] {e}")
+                self._handle_transport_exception(f"connection attempt for [{clean_hex[:10]}]", e)
                 if is_failover:
                     self.trigger_auto_failover(exclude_hash=clean_hex)
 
@@ -1007,15 +1142,28 @@ class ReticulumEngine:
         link.identify(self.identity)
 
         remote_identity = link.get_remote_identity()
-        if remote_identity:
+        remote_display = "Host"
+        remote_identity_hash = None
+        if remote_identity is not None:
+            remote_identity_hash = remote_identity.hash
             self.db.upsert_identity(
                 identity_hash=remote_identity.hash.hex(),
                 alias=f"Host-{remote_identity.hash.hex()[:6]}",
                 public_key=remote_identity.get_public_key()
             )
-            remote_hash = RNS.prettyhexrep(remote_identity.hash)[:10]
-        else:
-            remote_hash = "Host"
+            remote_display = RNS.prettyhexrep(remote_identity.hash)[:10]
+
+        requested_hash = self.current_host_hash or ""
+        if requested_hash:
+            try:
+                requested_bytes = bytes.fromhex(requested_hash)
+            except Exception:
+                requested_bytes = None
+            if requested_bytes is not None:
+                requested_display = RNS.prettyhexrep(requested_bytes)[:10]
+                if remote_identity_hash is None or requested_bytes != remote_identity_hash:
+                    remote_display = requested_display
+        remote_hash = remote_display
 
         # Persist host record (if we know the destination we attempted to connect to)
         try:
@@ -1030,6 +1178,8 @@ class ReticulumEngine:
 
                 host["identity"] = remote_identity
                 host["alias"] = getattr(remote_identity, "alias", host.get("alias") or f"Host-{self.current_host_hash[:6]}")
+                host["connected_via_identity"] = remote_identity.hash.hex() if remote_identity else None
+                host["connected_via_hash"] = self.current_host_hash
                 host["last_seen"] = time.time()
                 try:
                     host["hops"] = RNS.Transport.hops_to(host.get("hash_bytes")) or host.get("hops", 99)
@@ -1095,6 +1245,8 @@ class ReticulumEngine:
     def _on_link_closed(self, link):
         self.active_host_link = None
         self.host_channels = set()
+        host_label = self.current_host_hash or self._format_dest_label(getattr(link, "destination", None))
+        self._record_transport_diagnostic(f"Reticulum link closed for host [{host_label}]")
         self._notify_ui("system", "[bold red]Disconnected:[/] Host link dropped.")
         self._notify_ui("host_updated", {"display": "None", "last_seen": None})
 
@@ -1133,6 +1285,7 @@ class ReticulumEngine:
             else:
                 self._notify_ui("refresh_chat", None)
         except Exception as e:
+            self._handle_transport_exception("packet processing", e)
             self._notify_ui("system", f"Failed to process packet: {e}")
 
     def _host_link_active(self) -> bool:
@@ -1857,6 +2010,13 @@ class RetiSpeakeasyApp(App):
                 self.reload_calendar_events()
             elif event_type == "channels_updated":
                 self.sync_channel_tabs(data or [])
+            elif event_type == "diagnostic":
+                try:
+                    sys_log = self.query_one("#system-log", RichLog)
+                    sys_log.write(f"[bold magenta]Reticulum:[/] {data}")
+                    sys_log.scroll_end(animate=False)
+                except Exception:
+                    pass
             elif event_type == "host_updated":
                 # Support either a simple display string or a dict with last_seen
                 try:
