@@ -33,6 +33,11 @@ The goal of the project is to provide robust, resilient, and decentralized chann
 * [x] **Operator LXMF management:** Operators can manage the hub through LXMF commands, and the daemon records operator actions locally for auditing.
 * [x] **Client-side host selector and channel filtering:** The TUI host selection UI shows ranked hosts and can pre-filter them using announce channel summaries.
 * [x] **Client-side local channel purge controls:** Users can remove locally purged channel data from the client UI without reintroducing empty channels after reconnect.
+* [x] **Session tracking cleanup:** Host load/capacity accounting now prunes closed links and counts only active links so reconnects do not leak stale sessions.
+* [x] **Peer-level user blacklisting:** Clients can locally block or unblock peer identities, inspect their blacklist in the TUI, and suppress blocked authors across chat, bulletins, and calendar content.
+* [x] **Operator blacklist recommendations:** Hubs now learn peer operator LXMF endpoints, let operators broadcast signed blacklist recommendations with rationale, and store inbound recommendations for later review.
+* [x] **Bulletin lifecycle and archival:** Bulletins now auto-archive after the configured default window, can be manually archived/restored or author-deleted, and archived items are browseable from a dedicated BBS view toggle.
+* [x] **Interactive bulletin comments:** The main input box now acts as a bulletin reply control on the BBS tab, storing threaded bulletin comments locally under the selected bulletin.
 
 #### Host scoring notes
 Host selection currently uses a simple weighted score that favors hubs that are closer, less loaded, and more recently seen. The score is computed from three factors:
@@ -44,20 +49,11 @@ In practice, a higher score means “better candidate host” for connection and
 ### Remaining backlog
 
 ### A. Routing, Federation & Channel Discovery
-* [ ] **Dynamic Channel Discovery:** Mechanism during federation discovery so Hub A prioritizes federating with Hub B if both carry matching channels.
 * [ ] **Federation Graph Visibility:** Interface tools for clients and operators to visualize active federation topologies and relationships between Host nodes.
-* [ ] **Host Advertisement Metadata:** Inject host age/uptime metrics into client menu views.
 
 ### B. Access Control, Moderation & Identity
-* [ ] **Peer-Level User Blacklisting:** Local client-side blacklist controls to mute/block specific identities independently.
-* [ ] **Operator Blacklist Recommendation System:** Out-of-band LXMF broadcast mechanism allowing an operator to send signed blacklisting recommendations (with rationale) to peer operator addresses.
-* [ ] **Channel Management Matrix:** CLI/TUI/Config interface for operators to list, add, remove, and modify allowed/carried channels dynamically.
 
 ### C. Client & User Experience (UX/UI)
-* [ ] **Bulletin Lifecycle & Archival:** Support user-initiated deletion of posts and automated archiving to sub-pages after a configurable threshold (default: 7 days).
-* [ ] **Interactive Comments:** Repurpose the primary message input box beneath bulletin posts into a threaded comment submission control.
-* [ ] **Reticulum Diagnostics:** Surface underlying Reticulum pathing failures, interface drops, and transport errors into the client system log UI.
 
 ### D. System Stability, State & Metrics
-* [ ] **Session Tracking Bug:** Fix connection state leak where dropped/reconnected clients increment active user counts without purging stale interfaces.
 * [ ] **Hardware Load & Capacity Profiling:** Benchmark maximum stable concurrent connections per Host running on Raspberry Pi 4/5 hardware over typical internet backhaul (50–100 Mbps).

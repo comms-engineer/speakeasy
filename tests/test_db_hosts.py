@@ -102,6 +102,74 @@ def test_operator_action_audit_persists_and_orders_recent_first(tmp_path):
         db.close()
 
 
+def test_operator_blacklist_recommendations_dedupe_and_aggregate(tmp_path):
+    db_path = tmp_path / "operator-recommendations.db"
+    db = SpeakeasyDB(str(db_path))
+    try:
+        assert db.add_operator_blacklist_recommendation(
+            recommended_identity_hash="feedfacefeedface",
+            rationale="spam flood",
+            source_operator_hash="aa" * 16,
+            source_peer_hash="bb" * 16,
+            source_node_name="Alpha",
+        ) is True
+        assert db.add_operator_blacklist_recommendation(
+            recommended_identity_hash="feedfacefeedface",
+            rationale="spam flood",
+            source_operator_hash="aa" * 16,
+            source_peer_hash="bb" * 16,
+            source_node_name="Alpha",
+        ) is False
+        assert db.add_operator_blacklist_recommendation(
+            recommended_identity_hash="feedfacefeedface",
+            rationale="forged identities",
+            source_operator_hash="cc" * 16,
+            source_peer_hash="dd" * 16,
+            source_node_name="Beta",
+        ) is True
+
+        rows = db.get_recent_operator_blacklist_recommendations(limit=10)
+        summary = db.summarize_operator_blacklist_recommendations(limit=10)
+
+        assert len(rows) == 2
+        assert len(summary) == 1
+        assert summary[0]["recommended_identity_hash"] == "feedfacefeedface"
+        assert summary[0]["recommendation_count"] == 2
+        assert summary[0]["source_count"] == 2
+        assert "Alpha" in summary[0]["sources"]
+        assert "Beta" in summary[0]["sources"]
+        assert "spam flood" in summary[0]["rationales"]
+        assert "forged identities" in summary[0]["rationales"]
+    finally:
+        db.close()
+
+
+def test_bulletin_lifecycle_supports_archival_deletion_and_comments(tmp_path):
+    db_path = tmp_path / "bulletins.db"
+    db = SpeakeasyDB(str(db_path))
+    try:
+        db.upsert_identity("author-1", "author")
+        db.upsert_identity("author-2", "reply")
+        old_ts = time.time() - (9 * 86400)
+        db.add_bulletin("Old", "archive me", "author-1", old_ts, "bulletin-old", b"sig")
+        db.add_bulletin("New", "keep me", "author-1", time.time(), "bulletin-new", b"sig")
+
+        archived = db.archive_old_bulletins(older_than_days=7)
+        comment = db.add_bulletin_comment("bulletin-new", "author-2", "first reply")
+
+        assert archived == 1
+        assert comment is not None
+        assert db.get_bulletins(archived=False)[0]["bulletin_id"] == "bulletin-new"
+        assert db.get_bulletins(archived=True)[0]["bulletin_id"] == "bulletin-old"
+        assert len(db.get_bulletin_comments("bulletin-new")) == 1
+        deleted = db.delete_bulletin("bulletin-new", "author-1")
+        assert deleted is True
+        assert db.get_bulletins(archived=False) == []
+        assert db.add_bulletin_comment("bulletin-new", "author-2", "after delete") is None
+    finally:
+        db.close()
+
+
 def test_purge_local_channel_removes_related_rows(tmp_path):
     db_path = tmp_path / "purge-channel.db"
     db = SpeakeasyDB(str(db_path))

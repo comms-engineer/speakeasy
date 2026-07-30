@@ -2,7 +2,9 @@ import sqlite3
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import RNS
 from textual.app import App
+from textual.widgets import DataTable, Input, TabbedContent
 
 from reti_speakeasy import RetiSpeakeasyApp
 from speakeasy_db import Calendar, Event, SpeakeasyDB, create_calendar_tables
@@ -35,6 +37,7 @@ def test_calendar_ui_components_are_present():
                 if getattr(widget, "id", None)
             }
             assert "btn-calendar-open" in widget_ids
+            assert "btn-blocklist-open" in widget_ids
             assert "btn-channel-purge" in widget_ids
             assert "btn-channel-restore" in widget_ids
             assert "tab-bbs" in widget_ids
@@ -480,3 +483,173 @@ def test_calendar_and_event_models_round_trip():
         assert stored_event == event
     finally:
         connection.close()
+
+
+def test_purge_identity_removes_authored_calendar_events(tmp_path):
+    db = SpeakeasyDB(str(tmp_path / "blocked-events.db"))
+    try:
+        db.create_calendar(Calendar(
+            calendar_id="parlor",
+            name="Parlor",
+            description="",
+            owner_hash="owner-001",
+            visibility="public",
+            timezone="UTC",
+            channel="parlor",
+            created_at=1710000000,
+            updated_at=1710000000,
+        ))
+        db.create_event(Event(
+            event_id="evt-spam-1",
+            calendar_id="parlor",
+            title="Spam Event",
+            description="ignore this",
+            location="nowhere",
+            start_at=1710003600,
+            end_at=1710007200,
+            all_day=False,
+            status="scheduled",
+            channel="parlor",
+            created_by_hash="spammer-001",
+            created_at=1710003600,
+            updated_at=1710003600,
+            revision=1,
+        ))
+
+        removed = db.purge_identity("spammer-001")
+        event_changes = db.connection.execute("SELECT COUNT(*) FROM event_change").fetchone()[0]
+
+        assert removed == 1
+        assert db.list_events_for_channel("parlor") == []
+        assert event_changes == 0
+    finally:
+        db.close()
+
+
+def test_blocked_authors_are_hidden_from_bulletins_and_calendar_views(tmp_path):
+    app = RetiSpeakeasyApp()
+    db_path = tmp_path / "client-blocked-content.db"
+
+    def fake_engine_init(self, ui_callback=None):
+        self.ui_callback = ui_callback
+        self.hash_str = "test-hash"
+        self.db = SpeakeasyDB(str(db_path))
+        self.identity = SimpleNamespace(hash=SimpleNamespace(hex=lambda: "test-identity"))
+        self.host_manager = None
+        self.active_host_link = None
+        self.s2s_engine = None
+        self.host_channels = {"general"}
+        self.current_host_hash = None
+
+    async def check_hidden_content() -> None:
+        with patch("reti_speakeasy.ReticulumEngine.__init__", fake_engine_init), \
+             patch("reti_speakeasy.client_db_path", return_value=str(db_path)):
+            startup_db = SpeakeasyDB(str(db_path))
+            startup_db.add_channel("general", "Channel #general")
+            startup_db.create_calendar(Calendar(
+                calendar_id="general",
+                name="General",
+                description="",
+                owner_hash="owner-1",
+                visibility="public",
+                timezone="UTC",
+                channel="general",
+                created_at=1710000000,
+                updated_at=1710000000,
+            ))
+            blocked = RNS.Identity()
+            startup_db.upsert_identity(blocked.hash.hex(), "spammer", blocked.get_public_key())
+            startup_db.add_bulletin(
+                title="Blocked Bulletin",
+                body="ignore",
+                author_hash=blocked.hash.hex(),
+                timestamp=1710007200,
+                bulletin_id="blocked-bulletin",
+                signature=b"sig",
+            )
+            startup_db.create_event(Event(
+                event_id="evt-blocked",
+                calendar_id="general",
+                title="Blocked Event",
+                description="ignore",
+                location="none",
+                start_at=1710003600,
+                end_at=1710007200,
+                all_day=False,
+                status="scheduled",
+                channel="general",
+                created_by_hash=blocked.hash.hex(),
+                created_at=1710003600,
+                updated_at=1710003600,
+                revision=1,
+            ))
+            startup_db.block_identity(blocked.hash.hex(), reason="Blocked from Speakeasy")
+            startup_db.close()
+
+            async with app.run_test() as pilot:
+                app.sync_channel_tabs(["general"])
+                app.reload_bulletin_board()
+                app.reload_calendar_events()
+                await pilot.pause()
+
+                bbs_table = app.query_one("#bbs-table", DataTable)
+                calendar_table = app.query_one("#calendar-table-general", DataTable)
+                assert bbs_table.row_count == 0
+                assert calendar_table.row_count == 0
+
+    import asyncio
+    asyncio.run(check_hidden_content())
+
+
+def test_bulletin_archive_view_and_comment_input(tmp_path):
+    app = RetiSpeakeasyApp()
+    db_path = tmp_path / "client-bulletins.db"
+    now = 1710007200.0
+
+    def fake_engine_init(self, ui_callback=None):
+        self.ui_callback = ui_callback
+        self.hash_str = "test-hash"
+        self.db = SpeakeasyDB(str(db_path))
+        self.identity = SimpleNamespace(hash=SimpleNamespace(hex=lambda: "test-identity"))
+        self.host_manager = None
+        self.active_host_link = None
+        self.s2s_engine = None
+        self.host_channels = {"general"}
+        self.current_host_hash = None
+        self.bulletin_archive_days = 7.0
+
+    async def check_bulletins() -> None:
+        with patch("reti_speakeasy.ReticulumEngine.__init__", fake_engine_init), \
+             patch("reti_speakeasy.client_db_path", return_value=str(db_path)), \
+             patch("time.time", return_value=now):
+            startup_db = SpeakeasyDB(str(db_path))
+            startup_db.upsert_identity("test-identity", "operator")
+            startup_db.add_bulletin("Old Bulletin", "archive me", "test-identity", now - (9 * 86400), "old-bulletin", b"sig")
+            startup_db.add_bulletin("Fresh Bulletin", "keep me", "test-identity", now, "fresh-bulletin", b"sig")
+            startup_db.close()
+
+            async with app.run_test() as pilot:
+                tabs = app.query_one("#channel-tabs", TabbedContent)
+                tabs.active = "tab-bbs"
+                app.reload_bulletin_board()
+                await pilot.pause()
+
+                bbs_table = app.query_one("#bbs-table", DataTable)
+                assert bbs_table.row_count == 1
+                assert app.selected_bulletin_id == "fresh-bulletin"
+
+                input_widget = app.query_one("#chat-input", Input)
+                input_widget.value = "First comment"
+                app.on_input_submitted(SimpleNamespace(input=input_widget, value="First comment"))
+                await pilot.pause()
+
+                assert len(app.engine.db.get_bulletin_comments("fresh-bulletin")) == 1
+
+                app._toggle_bulletin_archive_view()
+                await pilot.pause()
+
+                assert app.query_one("#bbs-table", DataTable).row_count == 1
+                assert app.selected_bulletin_id == "old-bulletin"
+
+    import asyncio
+    asyncio.run(check_bulletins())

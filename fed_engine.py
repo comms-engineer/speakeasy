@@ -81,6 +81,7 @@ class FrameResult:
     learned_identities: List[str] = field(default_factory=list)
     channel_requests: List[Dict[str, Any]] = field(default_factory=list)
     hello_channels: List[str] = field(default_factory=list)
+    hello_operator_endpoint: str = ""
 
 
 class WireCodec:
@@ -231,13 +232,16 @@ class S2SProtocolEngine:
     def build_channel_poll_req(self, channel_name: str) -> bytes:
         return WireCodec.pack(Opcode.CHANNEL_POLL_REQ, self.local_hash_bytes, {0: channel_name})
 
-    def build_hello(self, active_channels: list[str]) -> bytes:
+    def build_hello(self, active_channels: list[str], operator_endpoint_hash: str = "") -> bytes:
         payload = {
             0: 1,
             1: self.bandwidth_class.value,
             2: active_channels,
             3: int(self.db.epoch_bucket_sec),
         }
+        endpoint = str(operator_endpoint_hash or "").strip().lower()
+        if endpoint:
+            payload[4] = endpoint
         return WireCodec.pack(Opcode.FED_HELLO, self.local_hash_bytes, payload)
 
     def build_channel_add(self, record: dict, hop_count: int = 0) -> bytes:
@@ -456,12 +460,15 @@ class S2SProtocolEngine:
             if isinstance(payload, dict):
                 raw_channels = payload.get(2) if 2 in payload else payload.get("2", [])
                 remote_bucket = payload.get(3) if 3 in payload else payload.get("3")
+                remote_operator_endpoint = payload.get(4) if 4 in payload else payload.get("4")
             elif isinstance(payload, (list, tuple)) and len(payload) > 3:
                 raw_channels = payload[2]
                 remote_bucket = payload[3]
+                remote_operator_endpoint = payload[4] if len(payload) > 4 else None
             else:
                 raw_channels = []
                 remote_bucket = None
+                remote_operator_endpoint = None
             
             channels = []
             for c in raw_channels if isinstance(raw_channels, list) else []:
@@ -485,6 +492,8 @@ class S2SProtocolEngine:
                     logger.warning(f"Invalid remote epoch bucket payload received: {remote_bucket}")
 
             result.hello_channels = channels
+            if remote_operator_endpoint:
+                result.hello_operator_endpoint = str(remote_operator_endpoint).strip().lower()
             sync_frame = self.build_sync_request(channels)
             if sync_frame:
                 outbound_frames.append(sync_frame)

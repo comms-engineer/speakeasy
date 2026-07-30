@@ -33,6 +33,16 @@ def test_hello_round_trips_and_carries_epoch_bucket(engine):
     assert payload[3] == engine.db.epoch_bucket_sec
 
 
+def test_hello_can_carry_operator_endpoint(engine):
+    opcode, origin, _, payload = WireCodec.unpack(
+        engine.build_hello(["parlor"], operator_endpoint_hash="ab" * 16)
+    )
+
+    assert opcode == Opcode.FED_HELLO
+    assert origin == engine.local_hash_bytes
+    assert payload[4] == "ab" * 16
+
+
 def test_every_builder_round_trips(engine):
     identity = RNS.Identity()
     engine.db.upsert_identity(identity.hash.hex(), "author", identity.get_public_key())

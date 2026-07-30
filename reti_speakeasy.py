@@ -633,6 +633,105 @@ class LocalChannelRestoreModal(ModalScreen[str]):
         self.dismiss(None)
 
 
+class PeerBlocklistModal(ModalScreen[dict]):
+    BINDINGS = [
+        ("escape", "dismiss_modal", "Cancel / Close")
+    ]
+
+    CSS = """
+    PeerBlocklistModal {
+        align: center middle;
+        background: rgba(0, 0, 0, 0.85);
+    }
+    #dialog {
+        padding: 1 2;
+        width: 76;
+        height: auto;
+        max-height: 90%;
+        border: thick $warning;
+        background: $surface;
+        layout: vertical;
+    }
+    #blocked-table {
+        height: 10;
+        margin-bottom: 1;
+    }
+    #block-input {
+        margin-bottom: 1;
+    }
+    #blocklist-help {
+        color: $text-muted;
+        margin-bottom: 1;
+    }
+    #button-row {
+        height: 3;
+        align: center middle;
+    }
+    Button {
+        margin: 0 1;
+    }
+    """
+
+    def __init__(self, entries: list[dict]):
+        super().__init__()
+        self.entries = entries
+        self.selected_identity = None
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="dialog"):
+            yield Label(" Peer Blacklist", id="modal-title")
+            yield DataTable(id="blocked-table")
+            yield Input(placeholder="Handle or hash prefix to block", id="block-input")
+            yield Label(" Local blocks can be added here or removed from the selected row. Node-wide blackholes are view-only.",
+                        id="blocklist-help")
+            with Horizontal(id="button-row"):
+                yield Button("Block Entered", variant="warning", id="btn-block")
+                yield Button("Unblock Selected", variant="success", id="btn-unblock")
+                yield Button("Cancel [Esc]", variant="error", id="btn-cancel")
+
+    def action_dismiss_modal(self) -> None:
+        self.dismiss(None)
+
+    def on_mount(self) -> None:
+        table = self.query_one("#blocked-table", DataTable)
+        table.cursor_type = "row"
+        table.add_columns("Identity", "Alias", "Scope")
+        table.clear()
+
+        for entry in self.entries:
+            identity_hash = str(entry.get("identity_hash") or "")
+            if not identity_hash:
+                continue
+            table.add_row(
+                identity_hash[:10],
+                str(entry.get("alias") or "unknown"),
+                str(entry.get("scope") or "blocked"),
+                key=identity_hash,
+            )
+            if self.selected_identity is None:
+                self.selected_identity = identity_hash
+
+    def on_data_table_row_selected(self, event: DataTable.RowSelected) -> None:
+        if event.data_table.id == "blocked-table":
+            self.selected_identity = str(event.row_key.value)
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        if event.button.id == "btn-block":
+            needle = self.query_one("#block-input", Input).value.strip()
+            if needle:
+                self.dismiss({"action": "block", "needle": needle})
+            else:
+                self.dismiss(None)
+            return
+        if event.button.id == "btn-unblock":
+            if self.selected_identity:
+                self.dismiss({"action": "unblock", "needle": self.selected_identity})
+            else:
+                self.dismiss(None)
+            return
+        self.dismiss(None)
+
+
 class BulletinPostModal(ModalScreen[dict]):
     BINDINGS = [("escape", "dismiss_modal", "Cancel / Close")]
 
@@ -957,6 +1056,7 @@ class ReticulumEngine:
         # outside this set is dropped by the hub, so the client must not
         # pretend a message to it was delivered.
         self.host_channels = set()
+        self.bulletin_archive_days = 7.0
 
         self.db = SpeakeasyDB(client_db_path(), max_message_bytes=MAX_MESSAGE_CONTENT_BYTES)
         self.rns = _initialise_reticulum()
@@ -1428,6 +1528,7 @@ class RetiSpeakeasyApp(App):
         ("h", "show_host_modal", "Select Host"),
         ("p", "show_profile_modal", "Edit Profile"),
         ("b", "show_bulletin_modal", "New Bulletin"),
+        ("k", "show_peer_blocklist_modal", "Peer Blacklist"),
         ("n", "show_channel_request_modal", "Request Channel"),
         ("m", "show_channel_manager_modal", "Manage Channels"),
         ("x", "show_local_channel_purge_modal", "Purge Local Channel"),
@@ -1449,12 +1550,15 @@ class RetiSpeakeasyApp(App):
                 yield Label("Initializing...", id="hash-label", classes="status-pill")
                 yield Label(" Connected Host", classes="widget-header")
                 yield Label("None", id="host-label", classes="status-pill")
-                yield Label("Shortcuts: H host • P profile • B bulletin • M channels", classes="hint-text")
+                yield Label("Shortcuts: H host • P profile • B bulletin • K blacklist • M channels", classes="hint-text")
                 yield Button(" Connect / Switch Host", id="btn-host-open", classes="sidebar-btn", variant="primary")
                 yield Button(" Manage Channels", id="btn-channel-manage", classes="sidebar-btn", variant="default")
+                yield Button(" Calendar Event", id="btn-calendar-open", classes="sidebar-btn", variant="primary")
+                yield Button(" Peer Blacklist", id="btn-blocklist-open", classes="sidebar-btn", variant="warning")
                 yield Button(" New Bulletin", id="btn-bulletin-open", classes="sidebar-btn", variant="success")
                 yield Button(" Request Channel", id="btn-channel-open", classes="sidebar-btn", variant="warning")
                 yield Button(" Purge / Restore", id="btn-channel-purge", classes="sidebar-btn secondary")
+                yield Button(" Restore Channel", id="btn-channel-restore", classes="sidebar-btn secondary")
                 yield Label(" System Log", classes="widget-header")
                 yield RichLog(id="system-log", classes="chat-log", highlight=True, markup=True)
             with Vertical(id="main-area"):
@@ -1480,6 +1584,9 @@ class RetiSpeakeasyApp(App):
                             yield Label(" Bulletin Board", classes="widget-header")
                             with Horizontal(id="bbs-top-bar"):
                                 yield Button(" Post New Bulletin", id="btn-bbs-post", variant="success")
+                                yield Button(" View Archived", id="btn-bbs-archive-toggle", variant="primary")
+                                yield Button(" Archive Selected", id="btn-bbs-archive-selected", variant="warning")
+                                yield Button(" Delete Selected", id="btn-bbs-delete-selected", variant="error")
                             yield DataTable(id="bbs-table")
                             yield RichLog(id="bbs-viewer", classes="chat-log", highlight=True, markup=True)
                 yield Input(placeholder="Type a message or use /commands for moderation",
@@ -1488,6 +1595,8 @@ class RetiSpeakeasyApp(App):
 
     def on_mount(self) -> None:
         self.engine = ReticulumEngine(ui_callback=self.handle_engine_event)
+        self.show_archived_bulletins = False
+        self.selected_bulletin_id = None
         self.query_one("#hash-label", Label).update(f"[bold gold1]{self.engine.hash_str}[/]")
 
         bbs_table = self.query_one("#bbs-table", DataTable)
@@ -1505,6 +1614,44 @@ class RetiSpeakeasyApp(App):
         self.reload_all_chat_logs()
         self.reload_bulletin_board()
         self.reload_calendar_events()
+
+    def _bulletin_archive_days(self) -> float:
+        return float(getattr(self.engine, "bulletin_archive_days", 7.0) or 7.0)
+
+    def _selected_bulletin(self) -> dict | None:
+        bulletin_id = getattr(self, "selected_bulletin_id", None)
+        if not bulletin_id:
+            return None
+        return self.engine.db.get_bulletin(str(bulletin_id))
+
+    def _render_bulletin_viewer(self, bulletin: dict | None) -> None:
+        viewer = self.query_one("#bbs-viewer", RichLog)
+        viewer.clear()
+        if not bulletin:
+            scope = "archived" if getattr(self, "show_archived_bulletins", False) else "active"
+            viewer.write(f"[dim]No {scope} bulletins to display.[/]")
+            return
+
+        author = bulletin.get("alias") or bulletin.get("author_hash", "")[:10]
+        date_str = datetime.datetime.fromtimestamp(bulletin["timestamp"]).strftime("%Y-%m-%d %H:%M:%S")
+        viewer.write(
+            f"[bold gold1]Title:[/] {escape(bulletin['title'])}\n"
+            f"[bold cyan]Author:[/] {escape(author)} ({bulletin['author_hash'][:10]})\n"
+            f"[bold yellow]Date:[/] {date_str}\n"
+            f"[dim]{'-'*50}[/dim]\n"
+            f"{escape(bulletin['body'])}"
+        )
+        comments = self.engine.db.get_bulletin_comments(bulletin["bulletin_id"])
+        if comments:
+            viewer.write("\n[bold]Comments:[/]")
+            for comment in comments:
+                comment_author = comment.get("alias") or comment.get("author_hash", "")[:10]
+                comment_ts = datetime.datetime.fromtimestamp(comment["timestamp"]).strftime("%Y-%m-%d %H:%M")
+                viewer.write(
+                    f"[dim]{comment_ts}[/dim] [bold cyan]{escape(comment_author)}:[/] {escape(comment['body'])}"
+                )
+        else:
+            viewer.write("\n[dim]No comments yet. Use the input below to reply to this bulletin.[/]")
 
     def get_current_channel(self) -> str:
         tabs = self.query_one("#channel-tabs", TabbedContent)
@@ -1537,35 +1684,32 @@ class RetiSpeakeasyApp(App):
 
     def reload_bulletin_board(self) -> None:
         table = self.query_one("#bbs-table", DataTable)
-        viewer = self.query_one("#bbs-viewer", RichLog)
         table.clear()
-        bulletins = self.engine.db.get_bulletins()
+        self.engine.db.archive_old_bulletins(self._bulletin_archive_days())
+        blocked = blackhole.blocked_hashes(self.engine.db)
+        bulletins = [
+            bulletin for bulletin in self.engine.db.get_bulletins(archived=bool(getattr(self, "show_archived_bulletins", False)))
+            if bulletin.get("author_hash") not in blocked
+        ]
         if not bulletins:
-            viewer.clear()
-            viewer.write("[dim]No bulletins yet. Post the first one to start the board.[/]")
+            self.selected_bulletin_id = None
+            self._render_bulletin_viewer(None)
             return
-        viewer.clear()
+
+        selected_id = getattr(self, "selected_bulletin_id", None)
         for b in bulletins:
             author = b.get("alias") or b["author_hash"][:10]
             date_str = datetime.datetime.fromtimestamp(b["timestamp"]).strftime("%Y-%m-%d %H:%M")
             table.add_row(b["title"], author, date_str, key=b["bulletin_id"])
-            viewer.write(f"[bold cyan]{escape(b['title'])}[/] — {escape(author)} — {escape(date_str)}")
+        selected = next((b for b in bulletins if b["bulletin_id"] == selected_id), bulletins[0])
+        self.selected_bulletin_id = selected["bulletin_id"]
+        self._render_bulletin_viewer(selected)
 
     def on_data_table_row_selected(self, event: DataTable.RowSelected) -> None:
         if event.data_table.id == "bbs-table":
             bulletin_id = event.row_key.value
-            bulletins = self.engine.db.get_bulletins()
-            selected = next((b for b in bulletins if b["bulletin_id"] == bulletin_id), None)
-            viewer = self.query_one("#bbs-viewer", RichLog)
-            viewer.clear()
-            if selected:
-                author = selected.get("alias") or selected["author_hash"][:10]
-                date_str = datetime.datetime.fromtimestamp(selected["timestamp"]).strftime("%Y-%m-%d %H:%M:%S")
-                viewer.write(f"[bold gold1]Title:[/] {escape(selected['title'])}\n"
-                             f"[bold cyan]Author:[/] {escape(author)} ({selected['author_hash'][:10]})\n"
-                             f"[bold yellow]Date:[/] {date_str}\n"
-                             f"[dim]{'-'*50}[/dim]\n"
-                             f"{escape(selected['body'])}")
+            self.selected_bulletin_id = str(bulletin_id)
+            self._render_bulletin_viewer(self._selected_bulletin())
 
     def action_show_host_modal(self) -> None:
         def handle_host_selection(selected_hash: str | None) -> None:
@@ -1732,6 +1876,30 @@ class RetiSpeakeasyApp(App):
 
         self.push_screen(LocalChannelRestoreModal(channels=channels), handle_restore)
 
+    def action_show_peer_blocklist_modal(self) -> None:
+        local = set(self.engine.db.blocked_identities())
+        node_wide = blackhole.blackholed_hashes()
+        entries = []
+        for identity_hash in sorted(local | node_wide):
+            record = self.engine.db.get_identity_record(identity_hash) or {}
+            entries.append({
+                "identity_hash": identity_hash,
+                "alias": record.get("alias") or "unknown",
+                "scope": "node-wide blackhole" if identity_hash in node_wide else "local block",
+            })
+
+        def handle_blocklist(data: dict | None) -> None:
+            if not data:
+                return
+            action = str(data.get("action") or "")
+            needle = str(data.get("needle") or "").strip()
+            if action == "block" and needle:
+                self.engine.block_identity(needle)
+            elif action == "unblock" and needle:
+                self.engine.unblock_identity(needle)
+
+        self.push_screen(PeerBlocklistModal(entries=entries), handle_blocklist)
+
     def _purge_local_channel(self, channel: str) -> None:
         clean = str(channel or "").lstrip("#").strip().lower()
         if not clean or clean == "bbs":
@@ -1800,11 +1968,43 @@ class RetiSpeakeasyApp(App):
     def action_show_bulletin_modal(self) -> None:
         def handle_bulletin(data: dict | None) -> None:
             if data:
-                self.engine.broadcast_bulletin(data["title"], data["body"])
-                self.notify("Bulletin posted and synchronized.")
-                self.reload_bulletin_board()
+                bulletin_id = self.engine.broadcast_bulletin(data["title"], data["body"])
+                if bulletin_id:
+                    self.selected_bulletin_id = bulletin_id
+                    self.show_archived_bulletins = False
+                    self.notify("Bulletin posted and synchronized.")
+                    self.reload_bulletin_board()
 
         self.push_screen(BulletinPostModal(), handle_bulletin)
+
+    def _toggle_bulletin_archive_view(self) -> None:
+        self.show_archived_bulletins = not bool(getattr(self, "show_archived_bulletins", False))
+        self.reload_bulletin_board()
+
+    def _archive_or_restore_selected_bulletin(self) -> None:
+        bulletin = self._selected_bulletin()
+        if not bulletin:
+            self.notify("Select a bulletin first.", severity="warning")
+            return
+        archived = bulletin.get("archived_at") is None
+        if self.engine.db.set_bulletin_archived(bulletin["bulletin_id"], archived=archived):
+            action = "Archived" if archived else "Restored"
+            self.notify(f"{action} bulletin: {bulletin['title']}")
+            if archived and not self.show_archived_bulletins:
+                self.selected_bulletin_id = None
+            self.reload_bulletin_board()
+
+    def _delete_selected_bulletin(self) -> None:
+        bulletin = self._selected_bulletin()
+        if not bulletin:
+            self.notify("Select a bulletin first.", severity="warning")
+            return
+        if not self.engine.db.delete_bulletin(bulletin["bulletin_id"], self.engine.identity.hash.hex()):
+            self.notify("You can only delete your own bulletins.", severity="error")
+            return
+        self.notify(f"Deleted bulletin: {bulletin['title']}")
+        self.selected_bulletin_id = None
+        self.reload_bulletin_board()
 
     def _ensure_calendar_exists(self, channel: str):
         db = self.engine.db
@@ -1889,7 +2089,11 @@ class RetiSpeakeasyApp(App):
 
         calendar_log.clear()
         calendar_table.clear()
-        events = self.engine.db.list_events_for_channel(channel)
+        blocked = blackhole.blocked_hashes(self.engine.db)
+        events = [
+            event for event in self.engine.db.list_events_for_channel(channel)
+            if event.created_by_hash not in blocked
+        ]
         if not events:
             calendar_log.write(f"No calendar events yet for #{channel}.")
             return
@@ -1921,8 +2125,16 @@ class RetiSpeakeasyApp(App):
             self.action_show_host_modal()
         elif event.button.id == "btn-profile-open":
             self.action_show_profile_modal()
+        elif event.button.id == "btn-blocklist-open":
+            self.action_show_peer_blocklist_modal()
         elif event.button.id in ("btn-bulletin-open", "btn-bbs-post"):
             self.action_show_bulletin_modal()
+        elif event.button.id == "btn-bbs-archive-toggle":
+            self._toggle_bulletin_archive_view()
+        elif event.button.id == "btn-bbs-archive-selected":
+            self._archive_or_restore_selected_bulletin()
+        elif event.button.id == "btn-bbs-delete-selected":
+            self._delete_selected_bulletin()
         elif event.button.id == "btn-channel-open":
             self.action_show_channel_request_modal()
         elif event.button.id == "btn-channel-manage":
@@ -2056,7 +2268,18 @@ class RetiSpeakeasyApp(App):
 
         if text:
             curr_chan = self.get_current_channel()
-            if curr_chan != "bbs" and self.engine.broadcast_chat_message(curr_chan, text):
+            if curr_chan == "bbs":
+                bulletin = self._selected_bulletin()
+                if not bulletin:
+                    self.notify("Select a bulletin before commenting.", severity="warning")
+                elif self.engine.db.add_bulletin_comment(
+                    bulletin_id=bulletin["bulletin_id"],
+                    author_hash=self.engine.identity.hash.hex(),
+                    body=text,
+                ):
+                    self._render_bulletin_viewer(self._selected_bulletin())
+                    self.notify("Comment added to bulletin thread.")
+            elif self.engine.broadcast_chat_message(curr_chan, text):
                 self.reload_all_chat_logs()
             event.input.value = ""
 

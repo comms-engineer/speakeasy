@@ -17,7 +17,7 @@ from fed_engine import (
     S2SProtocolEngine,
     WireCodec,
 )
-from operator_iface import OperatorInterface
+from operator_iface import OperatorInterface, RECOMMENDATION_TITLE
 from speakeasy_db import BandwidthClass, SpeakeasyDB, DEFAULT_EPOCH_BUCKET_SEC
 
 APP_NAME = "speakeasy"
@@ -122,6 +122,7 @@ class SpeakeasyDaemon:
         self.operator_bootstrap_retry_at = 0.0
         self.channel_presence_cache: dict[tuple[str, str], bool] = {}
         self.peer_channel_cache: dict[str, set[str]] = {}
+        self.peer_operator_endpoints: dict[str, str] = {}
 
         node_cfg = self.config.get("node", {})
         fed_cfg = self.config.get("federation", {})
@@ -238,6 +239,7 @@ class SpeakeasyDaemon:
                     operator_hash=self.operator_lxmf_hash,
                     command_handler=self.handle_operator_command,
                     node_name=self.node_name,
+                    peer_message_handler=self.handle_peer_operator_message,
                 )
             except Exception as e:
                 logger.error(f"Could not start the operator LXMF interface: {e}")
@@ -250,10 +252,11 @@ class SpeakeasyDaemon:
 
     def build_announce_payload(self) -> bytes:
         """Serializes host telemetry into a compact msgpack payload (< 128 bytes)."""
+        active_link_count = self._active_link_count()
         payload = {
             "v": 1,
             "name": self.node_name,
-            "load": len(self.active_links),
+            "load": active_link_count,
             "max_load": self.max_clients,
             "flags": 0b00000011  # Supports Bulletin + DM Buffer
         }
@@ -268,7 +271,7 @@ class SpeakeasyDaemon:
         """Broadcasts host destination announce and capacity metadata across Reticulum."""
         payload = self.build_announce_payload()
         self.destination.announce(app_data=payload)
-        logger.info(f"Broadcasted host announce for [{RNS.prettyhexrep(self.destination.hash)}] (Load: {len(self.active_links)}/{self.max_clients})")
+        logger.info(f"Broadcasted host announce for [{RNS.prettyhexrep(self.destination.hash)}] (Load: {self._active_link_count()}/{self.max_clients})")
 
     def _load_config(self) -> dict:
         if not os.path.exists(self.config_path):
@@ -283,7 +286,7 @@ class SpeakeasyDaemon:
             logger.info(f"Refused inbound link from blackholed identity [{remote.hash.hex()[:10]}]")
             link.teardown()
             return
-        if len(self.active_links) >= self.max_clients:
+        if self._active_link_count() >= self.max_clients:
             logger.warning(f"Refused inbound link: at capacity ({self.max_clients} clients).")
             link.teardown()
             return
@@ -314,9 +317,28 @@ class SpeakeasyDaemon:
         logger.info(f"Link established with [{remote_hash}]")
         self.announce_host()
 
-        hello_frame = self.s2s_engine.build_hello(self.db.get_active_channel_names())
+        hello_frame = self.s2s_engine.build_hello(
+            self.db.get_active_channel_names(),
+            operator_endpoint_hash=self.operator.endpoint_hash() if self.operator else "",
+        )
         RNS.Packet(link, hello_frame).send()
         self._bootstrap_link(link)
+
+    def _prune_stale_links(self):
+        self.active_links = [
+            link for link in self.active_links
+            if getattr(link, "status", None) != RNS.Link.CLOSED
+        ]
+
+    def _active_peer_links(self):
+        self._prune_stale_links()
+        return [
+            link for link in self.active_links
+            if getattr(link, "status", None) == RNS.Link.ACTIVE
+        ]
+
+    def _active_link_count(self) -> int:
+        return len(self._active_peer_links())
 
     def _rebuild_channel_policy(self):
         """Aligns runtime policy with persisted channel lifecycle state."""
@@ -362,8 +384,8 @@ class SpeakeasyDaemon:
         if not frames:
             return 0
         peers = [
-            link for link in self.active_links
-            if link is not exclude_link and link.status == RNS.Link.ACTIVE
+            link for link in self._active_peer_links()
+            if link is not exclude_link
         ]
         for link in peers:
             self._send_frames(link, frames)
@@ -414,6 +436,14 @@ class SpeakeasyDaemon:
                 cache = self.peer_channel_cache
             cache[peer_key] = set(cache.get(peer_key, set())) | normalized
 
+    def _remember_peer_operator_endpoint(self, link, endpoint_hash: str) -> None:
+        peer_key = self._peer_key(link)
+        endpoint = str(endpoint_hash or "").strip().lower()
+        if not peer_key or not endpoint:
+            return
+        self.peer_operator_endpoints[peer_key] = endpoint
+        self.db.save_peer_operator_endpoint(peer_key, endpoint)
+
     def _on_remote_identified(self, link, remote_identity):
         if remote_identity and blackhole.is_blocked(remote_identity.hash, self.db):
             # A link identifies after establishment, so this is the first point
@@ -443,6 +473,8 @@ class SpeakeasyDaemon:
     def _on_link_closed(self, link):
         if link in self.active_links:
             self.active_links.remove(link)
+        else:
+            self._prune_stale_links()
         logger.info("Client link closed.")
         self.announce_host()
 
@@ -485,6 +517,8 @@ class SpeakeasyDaemon:
                 self._remember_channel_presence(channel_name, packet.link, present)
             elif getattr(result, "hello_channels", None):
                 self._remember_peer_channels(packet.link, result.hello_channels)
+                if getattr(result, "hello_operator_endpoint", ""):
+                    self._remember_peer_operator_endpoint(packet.link, result.hello_operator_endpoint)
 
             peer_count = self._broadcast(relay_frames, exclude_link=packet.link)
             if peer_count and relay_frames:
@@ -539,7 +573,7 @@ class SpeakeasyDaemon:
         body = (
             f"{self.node_name} is alive.\n"
             f"Node hash: {self.identity.hash.hex()[:16]}\n"
-            f"Active links: {len(self.active_links)}/{self.max_clients}\n"
+            f"Active links: {self._active_link_count()}/{self.max_clients}\n"
             f"Channels: {active} active, {blocked} blocked\n\n"
             f"Reply with 'help' for operator commands."
         )
@@ -571,6 +605,10 @@ class SpeakeasyDaemon:
             "pending (alias: requests)\n"
             "channels\n"
             "recent [N] (alias: audit)\n"
+            "recommend <identity> <reason>\n"
+            "recommendations [N]\n"
+            "blockid <identity> [reason]\n"
+            "unblockid <identity>\n"
             "approve <channel>\n"
             "deny <channel>\n"
             "add <channel> [description]\n"
@@ -621,6 +659,7 @@ class SpeakeasyDaemon:
         blocked = sum(1 for c in channels if str(c.get("status") or "active").lower() == "blocked")
         pending = len(self.db.get_channel_requests("pending"))
         endpoint = self.operator.endpoint_hash()[:16] if self.operator else "unavailable"
+        peer_operator_count = len(self.db.list_peer_operator_endpoints())
 
         return (
             f"Node: {self.node_name}\n"
@@ -628,9 +667,147 @@ class SpeakeasyDaemon:
             f"LXMF endpoint: {endpoint}\n"
             f"Links: {len(self.active_links)}/{self.max_clients}\n"
             f"Discovered peers: {len(self.discovered_peers)}\n"
+            f"Peer operator endpoints: {peer_operator_count}\n"
             f"Channels: {active} active, {paused} paused, {blocked} blocked\n"
             f"Pending channel requests: {pending}"
         )
+
+    def _operator_recommendations_text(self, argument: str = "") -> str:
+        limit = 10
+        if argument:
+            try:
+                limit = max(1, min(int(argument.strip()), 50))
+            except ValueError:
+                return "Usage: recommendations [N]"
+
+        rows = self.db.summarize_operator_blacklist_recommendations(limit=limit)
+        if not rows:
+            return "No blacklist recommendations recorded yet."
+
+        lines = ["Blacklist recommendation summary:"]
+        for row in rows:
+            ts = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(float(row.get("latest_received_at") or 0)))
+            target = str(row.get("recommended_identity_hash") or "")[:10]
+            recommendation_count = int(row.get("recommendation_count") or 0)
+            source_count = int(row.get("source_count") or 0)
+            rationales = str(row.get("rationales") or "(no rationale)")
+            sources = str(row.get("sources") or "unknown")
+            lines.append(
+                f"{ts} | {target} | {recommendation_count} report(s) from {source_count} source(s) | "
+                f"sources={sources} | reasons={rationales}"
+            )
+        return "\n".join(lines)
+
+    def block_identity_for_operator(self, argument: str) -> str:
+        identity_token, _, reason = str(argument or "").strip().partition(" ")
+        clean_reason = reason.strip() or "Operator block"
+        if not identity_token:
+            return "Usage: blockid <identity> [reason]"
+
+        identity_hash = self.db.resolve_identity(identity_token) or identity_token.strip().lower()
+        if not identity_hash:
+            return "Usage: blockid <identity> [reason]"
+        if self.db.is_blocked(identity_hash):
+            return f"Identity {identity_hash[:10]} is already blocked."
+
+        if not self.db.block_identity(identity_hash, reason=clean_reason):
+            return f"Identity {identity_hash[:10]} is already blocked."
+
+        removed = self.db.purge_identity(identity_hash)
+        self._log_operator_action(
+            "block_identity",
+            target=identity_hash,
+            detail=f"reason={clean_reason}; purged={removed}",
+        )
+        return f"Blocked identity {identity_hash[:10]} and purged {removed} local record(s)."
+
+    def unblock_identity_for_operator(self, argument: str) -> str:
+        identity_token = str(argument or "").strip()
+        if not identity_token:
+            return "Usage: unblockid <identity>"
+
+        identity_hash = self.db.resolve_identity(identity_token) or identity_token.lower()
+        if not self.db.unblock_identity(identity_hash):
+            return f"Identity {identity_hash[:10]} is not locally blocked."
+
+        self._log_operator_action("unblock_identity", target=identity_hash)
+        return f"Unblocked identity {identity_hash[:10]}."
+
+    def recommend_blacklist_identity(self, argument: str) -> str:
+        identity_token, _, rationale = str(argument or "").strip().partition(" ")
+        rationale = rationale.strip()
+        if not identity_token or not rationale:
+            return "Usage: recommend <identity> <reason>"
+
+        identity_hash = self.db.resolve_identity(identity_token) or identity_token.strip().lower()
+        if not identity_hash:
+            return "Usage: recommend <identity> <reason>"
+        if not self.operator:
+            return "Operator LXMF interface is not available."
+
+        endpoints = []
+        seen = set()
+        for row in self.db.list_peer_operator_endpoints():
+            endpoint = str(row.get("operator_endpoint_hash") or "").strip().lower()
+            if endpoint and endpoint not in seen:
+                seen.add(endpoint)
+                endpoints.append(endpoint)
+        if not endpoints:
+            return "No peer operator endpoints known yet."
+
+        payload = self.operator.format_blacklist_recommendation(
+            recommended_identity_hash=identity_hash,
+            rationale=rationale,
+            source_peer_hash=self.identity.hash.hex(),
+        )
+        delivered = 0
+        for endpoint in endpoints:
+            if self.operator.notify_peer_operator(endpoint, RECOMMENDATION_TITLE, payload):
+                delivered += 1
+
+        self._log_operator_action(
+            "recommend_blacklist_identity",
+            target=identity_hash,
+            detail=f"sent_to={delivered}; rationale={rationale}",
+        )
+        return f"Broadcast blacklist recommendation for {identity_hash[:10]} to {delivered} peer operator(s)."
+
+    def handle_peer_operator_message(self, source_hash: str, title: str, body: str) -> None:
+        if title != RECOMMENDATION_TITLE:
+            return
+        try:
+            payload = json.loads(body)
+        except json.JSONDecodeError:
+            logger.warning("Ignored malformed operator recommendation from [%s]", source_hash[:10])
+            return
+
+        recommended_identity_hash = str(payload.get("recommended_identity_hash") or "").strip().lower()
+        rationale = str(payload.get("rationale") or "").strip()
+        source_peer_hash = str(payload.get("source_peer_hash") or "").strip().lower()
+        source_node_name = str(payload.get("source_node_name") or "").strip()
+        source_operator_hash = str(payload.get("source_operator_hash") or source_hash).strip().lower()
+        if not recommended_identity_hash or not rationale:
+            logger.warning("Ignored incomplete operator recommendation from [%s]", source_hash[:10])
+            return
+
+        self.db.add_operator_blacklist_recommendation(
+            recommended_identity_hash=recommended_identity_hash,
+            rationale=rationale,
+            source_operator_hash=source_operator_hash,
+            source_peer_hash=source_peer_hash,
+            source_node_name=source_node_name,
+        )
+        self._log_operator_action(
+            "receive_blacklist_recommendation",
+            target=recommended_identity_hash,
+            detail=f"from={source_node_name or source_peer_hash or source_operator_hash}",
+        )
+        if self.operator:
+            sender = source_node_name or source_peer_hash or source_operator_hash[:10]
+            self.operator.notify(
+                "Blacklist recommendation received",
+                f"{sender} recommended blocking {recommended_identity_hash[:16]}\nReason: {rationale}",
+            )
 
     def approve_channel(self, name: str) -> str:
         pending = {r["name"]: r for r in self.db.get_channel_requests("pending")}
@@ -710,6 +887,14 @@ class SpeakeasyDaemon:
             return self._operator_status_text()
         if command in {"recent", "audit"}:
             return self._operator_recent_text(argument)
+        if command == "recommend" and argument:
+            return self.recommend_blacklist_identity(argument)
+        if command in {"recommendations", "recs"}:
+            return self._operator_recommendations_text(argument)
+        if command == "blockid":
+            return self.block_identity_for_operator(argument)
+        if command == "unblockid":
+            return self.unblock_identity_for_operator(argument)
         if command == "approve" and argument:
             return self.approve_channel(argument.lstrip("#"))
         if command == "deny" and argument:
@@ -773,6 +958,7 @@ class SpeakeasyDaemon:
         logger.info(f"Discovered Speakeasy hub '{name}' at [{peer_hex[:10]}]")
 
     def _is_connected_to(self, identity) -> bool:
+        self._prune_stale_links()
         for link in self.active_links:
             remote = link.get_remote_identity()
             if remote and remote.hash == identity.hash and link.status != RNS.Link.CLOSED:
@@ -811,7 +997,7 @@ class SpeakeasyDaemon:
 
         ranked_peers = []
         for peer_hex, identity in list(self.discovered_peers.items()):
-            if len(self.active_links) >= self.max_clients:
+            if self._active_link_count() >= self.max_clients:
                 logger.info("At link capacity; deferring discovered peer connections.")
                 return
             if self._is_connected_to(identity) or blackhole.is_blocked(identity.hash, self.db):
@@ -850,7 +1036,7 @@ class SpeakeasyDaemon:
                 if identity:
                     already_connected = any(
                         link.get_remote_identity() and link.get_remote_identity().hash == identity.hash
-                        for link in self.active_links if link.status == RNS.Link.ACTIVE
+                        for link in self._active_peer_links()
                     )
                     if not already_connected:
                         self._link_to(identity, clean_hex)

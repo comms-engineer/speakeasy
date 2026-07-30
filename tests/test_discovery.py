@@ -32,12 +32,14 @@ def daemon(tmp_path):
     """A daemon with only the state discovery touches, and no RNS stack."""
     instance = SpeakeasyDaemon.__new__(SpeakeasyDaemon)
     instance.identity = RNS.Identity()
+    instance.node_name = "Test Hub"
     instance.db = SpeakeasyDB(str(tmp_path / "hub.db"))
     instance.active_links = []
     instance.discovered_peers = {}
     instance.max_clients = 2
     instance.settlement_delay = 0
     instance.auto_discover_peers = True
+    instance.include_channel_summary_in_announces = False
     instance.linked = []
     instance.channel_presence_cache = {}
     instance.s2s_engine = S2SProtocolEngine(
@@ -106,6 +108,19 @@ def test_discovery_respects_capacity(daemon):
     daemon.connect_discovered_peers()
 
     assert daemon.linked == []
+
+
+def test_closed_links_do_not_count_toward_capacity_or_announced_load(daemon):
+    _, destination = announce(daemon)
+    closed_link = FakeLink(RNS.Identity(), status=RNS.Link.CLOSED)
+    daemon.active_links = [closed_link]
+
+    payload = msgpack.unpackb(daemon.build_announce_payload(), raw=False)
+    daemon.connect_discovered_peers()
+
+    assert payload["load"] == 0
+    assert daemon.linked == [destination.hash.hex()]
+    assert daemon.active_links == []
 
 
 def test_discovered_peers_are_prioritized_by_channel_affinity(daemon):

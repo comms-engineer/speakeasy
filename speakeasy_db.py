@@ -767,6 +767,20 @@ class SpeakeasyDB(CalendarStore):
                     signature BLOB
                 )
             """)
+            existing_bulletin_cols = {row[1] for row in cursor.execute("PRAGMA table_info(bulletins)")}
+            for column, decl in (("archived_at", "REAL"), ("deleted_at", "REAL")):
+                if column not in existing_bulletin_cols:
+                    cursor.execute(f"ALTER TABLE bulletins ADD COLUMN {column} {decl}")
+
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS bulletin_comments (
+                    comment_id TEXT PRIMARY KEY,
+                    bulletin_id TEXT,
+                    author_hash TEXT,
+                    body TEXT,
+                    timestamp REAL
+                )
+            """)
 
             # Channels table. approver_hash/signature are populated for
             # channels approved by a hub operator; locally seeded channels
@@ -834,6 +848,26 @@ class SpeakeasyDB(CalendarStore):
                 )
             """)
 
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS peer_operator_endpoints (
+                    peer_identity_hash TEXT PRIMARY KEY,
+                    operator_endpoint_hash TEXT,
+                    learned_at REAL
+                )
+            """)
+
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS operator_blacklist_recommendations (
+                    recommendation_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    recommended_identity_hash TEXT,
+                    rationale TEXT,
+                    source_operator_hash TEXT,
+                    source_peer_hash TEXT,
+                    source_node_name TEXT,
+                    received_at REAL
+                )
+            """)
+
             # Client-side channel visibility preferences scoped to a host.
             cursor.execute("""
                 CREATE TABLE IF NOT EXISTS client_channel_prefs (
@@ -856,6 +890,7 @@ class SpeakeasyDB(CalendarStore):
             # anti-entropy round; the bulletin index backs the board view.
             cursor.execute("CREATE INDEX IF NOT EXISTS idx_messages_channel_ts ON messages (channel, timestamp)")
             cursor.execute("CREATE INDEX IF NOT EXISTS idx_bulletins_ts ON bulletins (timestamp DESC)")
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_bulletin_comments_bulletin_ts ON bulletin_comments (bulletin_id, timestamp ASC)")
 
             # Seed default channel if empty
             cursor.execute("SELECT COUNT(*) FROM channels")
@@ -1001,6 +1036,131 @@ class SpeakeasyDB(CalendarStore):
                 SELECT action_id, timestamp, action, target, detail
                 FROM operator_actions
                 ORDER BY timestamp DESC, action_id DESC
+                LIMIT ?
+                """,
+                (max_rows,),
+            )
+            return [dict(row) for row in cursor.fetchall()]
+
+    def save_peer_operator_endpoint(self, peer_identity_hash: str, operator_endpoint_hash: str) -> bool:
+        peer_hash = str(peer_identity_hash or "").strip().lower()
+        endpoint_hash = str(operator_endpoint_hash or "").strip().lower()
+        if not peer_hash or not endpoint_hash:
+            return False
+        with self._tx() as cursor:
+            cursor.execute(
+                """
+                INSERT INTO peer_operator_endpoints (peer_identity_hash, operator_endpoint_hash, learned_at)
+                VALUES (?, ?, ?)
+                ON CONFLICT(peer_identity_hash) DO UPDATE SET
+                    operator_endpoint_hash = excluded.operator_endpoint_hash,
+                    learned_at = excluded.learned_at
+                """,
+                (peer_hash, endpoint_hash, time.time()),
+            )
+        return True
+
+    def get_peer_operator_endpoint(self, peer_identity_hash: str) -> Optional[str]:
+        with self._tx() as cursor:
+            cursor.execute(
+                "SELECT operator_endpoint_hash FROM peer_operator_endpoints WHERE peer_identity_hash = ?",
+                (str(peer_identity_hash or "").strip().lower(),),
+            )
+            row = cursor.fetchone()
+        return str(row[0]) if row and row[0] else None
+
+    def list_peer_operator_endpoints(self) -> List[Dict[str, Any]]:
+        with self._tx() as cursor:
+            cursor.execute(
+                """
+                SELECT peer_identity_hash, operator_endpoint_hash, learned_at
+                FROM peer_operator_endpoints
+                ORDER BY learned_at DESC, peer_identity_hash ASC
+                """
+            )
+            return [dict(row) for row in cursor.fetchall()]
+
+    def add_operator_blacklist_recommendation(self, recommended_identity_hash: str, rationale: str,
+                                              source_operator_hash: str, source_peer_hash: str = "",
+                                              source_node_name: str = "") -> bool:
+        target = str(recommended_identity_hash or "").strip().lower()
+        sender = str(source_operator_hash or "").strip().lower()
+        if not target or not sender:
+            return False
+        with self._tx() as cursor:
+            cursor.execute(
+                """
+                SELECT 1
+                FROM operator_blacklist_recommendations
+                WHERE recommended_identity_hash = ?
+                  AND rationale = ?
+                  AND source_operator_hash = ?
+                  AND source_peer_hash = ?
+                  AND source_node_name = ?
+                LIMIT 1
+                """,
+                (
+                    target,
+                    str(rationale or "").strip(),
+                    sender,
+                    str(source_peer_hash or "").strip().lower(),
+                    str(source_node_name or "").strip(),
+                ),
+            )
+            if cursor.fetchone() is not None:
+                return False
+            cursor.execute(
+                """
+                INSERT INTO operator_blacklist_recommendations (
+                    recommended_identity_hash, rationale, source_operator_hash,
+                    source_peer_hash, source_node_name, received_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    target,
+                    str(rationale or "").strip(),
+                    sender,
+                    str(source_peer_hash or "").strip().lower(),
+                    str(source_node_name or "").strip(),
+                    time.time(),
+                ),
+            )
+        return True
+
+    def get_recent_operator_blacklist_recommendations(self, limit: int = 10) -> List[Dict[str, Any]]:
+        max_rows = max(1, min(int(limit or 10), 100))
+        with self._tx() as cursor:
+            cursor.execute(
+                """
+                SELECT recommendation_id, recommended_identity_hash, rationale,
+                       source_operator_hash, source_peer_hash, source_node_name, received_at
+                FROM operator_blacklist_recommendations
+                ORDER BY received_at DESC, recommendation_id DESC
+                LIMIT ?
+                """,
+                (max_rows,),
+            )
+            return [dict(row) for row in cursor.fetchall()]
+
+    def summarize_operator_blacklist_recommendations(self, limit: int = 10) -> List[Dict[str, Any]]:
+        max_rows = max(1, min(int(limit or 10), 100))
+        with self._tx() as cursor:
+            cursor.execute(
+                """
+                SELECT recommended_identity_hash,
+                       COUNT(*) AS recommendation_count,
+                       COUNT(DISTINCT source_operator_hash) AS source_count,
+                       MAX(received_at) AS latest_received_at,
+                       GROUP_CONCAT(DISTINCT CASE
+                           WHEN source_node_name IS NOT NULL AND source_node_name != '' THEN source_node_name
+                           WHEN source_peer_hash IS NOT NULL AND source_peer_hash != '' THEN source_peer_hash
+                           ELSE source_operator_hash
+                       END) AS sources,
+                       GROUP_CONCAT(DISTINCT rationale) AS rationales
+                FROM operator_blacklist_recommendations
+                GROUP BY recommended_identity_hash
+                ORDER BY latest_received_at DESC, recommendation_count DESC, recommended_identity_hash ASC
                 LIMIT ?
                 """,
                 (max_rows,),
@@ -1443,9 +1603,29 @@ class SpeakeasyDB(CalendarStore):
         recognised (and then refused) rather than triggering identity requests.
         """
         with self._tx() as cursor:
+            cursor.execute("SELECT event_id FROM event WHERE created_by_hash = ?", (identity_hash,))
+            event_ids = [row[0] for row in cursor.fetchall()]
+            cursor.execute("SELECT bulletin_id FROM bulletins WHERE author_hash = ?", (identity_hash,))
+            bulletin_ids = [row[0] for row in cursor.fetchall()]
             cursor.execute("DELETE FROM messages WHERE sender_hash = ?", (identity_hash,))
             removed = cursor.rowcount
+            if bulletin_ids:
+                placeholders = ", ".join("?" for _ in bulletin_ids)
+                cursor.execute(
+                    f"DELETE FROM bulletin_comments WHERE bulletin_id IN ({placeholders})",
+                    tuple(bulletin_ids),
+                )
             cursor.execute("DELETE FROM bulletins WHERE author_hash = ?", (identity_hash,))
+            removed += cursor.rowcount
+            cursor.execute("DELETE FROM bulletin_comments WHERE author_hash = ?", (identity_hash,))
+            if event_ids:
+                placeholders = ", ".join("?" for _ in event_ids)
+                cursor.execute(
+                    f"DELETE FROM event_change WHERE event_id IN ({placeholders})",
+                    tuple(event_ids),
+                )
+            cursor.execute("DELETE FROM event_change WHERE created_by_hash = ?", (identity_hash,))
+            cursor.execute("DELETE FROM event WHERE created_by_hash = ?", (identity_hash,))
             removed += cursor.rowcount
             cursor.execute("DELETE FROM profiles WHERE identity_hash = ?", (identity_hash,))
         return removed
@@ -1461,13 +1641,16 @@ class SpeakeasyDB(CalendarStore):
     # ----------------------------------------------------------------------
 
     def add_bulletin(self, title: str, body: str, author_hash: str, timestamp: float,
-                     bulletin_id: str, signature: bytes) -> bool:
+                     bulletin_id: str, signature: bytes, archived_at: Optional[float] = None,
+                     deleted_at: Optional[float] = None) -> bool:
         try:
             with self._tx() as cursor:
                 cursor.execute("""
-                    INSERT INTO bulletins (bulletin_id, title, body, author_hash, timestamp, signature)
-                    VALUES (?, ?, ?, ?, ?, ?)
-                """, (bulletin_id, title, body, author_hash, timestamp, signature))
+                    INSERT INTO bulletins (
+                        bulletin_id, title, body, author_hash, timestamp, signature, archived_at, deleted_at
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """, (bulletin_id, title, body, author_hash, timestamp, signature, archived_at, deleted_at))
             return True
         except sqlite3.IntegrityError:
             return False
@@ -1513,7 +1696,26 @@ class SpeakeasyDB(CalendarStore):
         return self.add_bulletin(title=title, body=body, author_hash=author_hash,
                                  timestamp=timestamp, bulletin_id=bulletin_id, signature=signature)
 
-    def get_bulletins(self, limit: int = 50) -> List[Dict[str, Any]]:
+    def get_bulletin(self, bulletin_id: str) -> Optional[Dict[str, Any]]:
+        with self._tx() as cursor:
+            cursor.execute(
+                """
+                SELECT
+                    b.*,
+                    COALESCE(i.alias, p.handle) AS alias
+                FROM bulletins b
+                LEFT JOIN identities i ON b.author_hash = i.identity_hash
+                LEFT JOIN profiles p ON b.author_hash = p.identity_hash
+                WHERE b.bulletin_id = ?
+                LIMIT 1
+                """,
+                (str(bulletin_id or ""),),
+            )
+            row = cursor.fetchone()
+        return dict(row) if row else None
+
+    def get_bulletins(self, limit: int = 50, archived: bool = False,
+                     include_deleted: bool = False) -> List[Dict[str, Any]]:
         with self._tx() as cursor:
             cursor.execute("""
                 SELECT
@@ -1522,9 +1724,94 @@ class SpeakeasyDB(CalendarStore):
                 FROM bulletins b
                 LEFT JOIN identities i ON b.author_hash = i.identity_hash
                 LEFT JOIN profiles p ON b.author_hash = p.identity_hash
+                WHERE (? = 1 OR b.deleted_at IS NULL)
+                  AND ((? = 1 AND b.archived_at IS NOT NULL) OR (? = 0 AND b.archived_at IS NULL))
                 ORDER BY b.timestamp DESC
                 LIMIT ?
-            """, (limit,))
+            """, (1 if include_deleted else 0, 1 if archived else 0, 1 if archived else 0, limit))
+            return [dict(row) for row in cursor.fetchall()]
+
+    def archive_old_bulletins(self, older_than_days: float = 7.0) -> int:
+        if not older_than_days or older_than_days <= 0:
+            return 0
+        cutoff = time.time() - float(older_than_days) * 86400
+        with self._tx() as cursor:
+            cursor.execute(
+                """
+                UPDATE bulletins
+                SET archived_at = ?
+                WHERE deleted_at IS NULL
+                  AND archived_at IS NULL
+                  AND timestamp < ?
+                """,
+                (time.time(), cutoff),
+            )
+            return cursor.rowcount
+
+    def set_bulletin_archived(self, bulletin_id: str, archived: bool = True) -> bool:
+        with self._tx() as cursor:
+            cursor.execute(
+                """
+                UPDATE bulletins
+                SET archived_at = ?
+                WHERE bulletin_id = ? AND deleted_at IS NULL
+                """,
+                (time.time() if archived else None, str(bulletin_id or "")),
+            )
+            return cursor.rowcount > 0
+
+    def delete_bulletin(self, bulletin_id: str, actor_hash: str) -> bool:
+        record = self.get_bulletin(bulletin_id)
+        if not record or record.get("deleted_at") is not None:
+            return False
+        if str(record.get("author_hash") or "") != str(actor_hash or ""):
+            return False
+        with self._tx() as cursor:
+            cursor.execute(
+                "UPDATE bulletins SET deleted_at = ? WHERE bulletin_id = ?",
+                (time.time(), str(bulletin_id or "")),
+            )
+            return cursor.rowcount > 0
+
+    def add_bulletin_comment(self, bulletin_id: str, author_hash: str, body: str,
+                             timestamp: Optional[float] = None, comment_id: Optional[str] = None) -> Optional[Dict[str, Any]]:
+        bulletin = self.get_bulletin(bulletin_id)
+        if not bulletin or bulletin.get("deleted_at") is not None:
+            return None
+        ts = float(timestamp or time.time())
+        raw_id_data = f"{bulletin_id}:{author_hash}:{ts}:{body}:{time.time_ns()}"
+        comment_key = comment_id or hashlib.sha256(raw_id_data.encode("utf-8")).hexdigest()
+        with self._tx() as cursor:
+            cursor.execute(
+                """
+                INSERT INTO bulletin_comments (comment_id, bulletin_id, author_hash, body, timestamp)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (comment_key, str(bulletin_id), str(author_hash), str(body), ts),
+            )
+        return {
+            "comment_id": comment_key,
+            "bulletin_id": str(bulletin_id),
+            "author_hash": str(author_hash),
+            "body": str(body),
+            "timestamp": ts,
+        }
+
+    def get_bulletin_comments(self, bulletin_id: str) -> List[Dict[str, Any]]:
+        with self._tx() as cursor:
+            cursor.execute(
+                """
+                SELECT
+                    c.*,
+                    COALESCE(i.alias, p.handle) AS alias
+                FROM bulletin_comments c
+                LEFT JOIN identities i ON c.author_hash = i.identity_hash
+                LEFT JOIN profiles p ON c.author_hash = p.identity_hash
+                WHERE c.bulletin_id = ?
+                ORDER BY c.timestamp ASC, c.comment_id ASC
+                """,
+                (str(bulletin_id or ""),),
+            )
             return [dict(row) for row in cursor.fetchall()]
 
     # ----------------------------------------------------------------------
