@@ -1202,11 +1202,16 @@ class RetiSpeakeasyApp(App):
     Screen { layout: horizontal; background: $surface; }
     #sidebar { width: 38; height: 100%; background: $panel; border-right: heavy $accent; padding: 0 1; layout: vertical; }
     #main-area { width: 1fr; height: 100%; layout: vertical; }
-    #channel-tabs { height: 1fr; }
+    #channel-tabs { height: 1fr; min-height: 12; }
     .widget-header { background: $accent; color: $text; text-style: bold; padding: 0 1; width: 100%; margin-top: 1; }
     .status-pill { background: $boost; color: $text; padding: 0 1; width: 100%; margin-top: 1; }
+    #main-banner { height: auto; min-height: 5; padding: 1; margin-bottom: 1; border: round $accent; background: $boost; }
+    .main-banner-title { text-style: bold; color: $accent; }
+    .main-banner-subtitle { color: $text-muted; }
     #chat-input { width: 100%; dock: bottom; margin-top: 1; }
     .sidebar-btn { width: 100%; margin-top: 1; }
+    .sidebar-btn.secondary { background: $panel; color: $text; }
+    .hint-text { color: $text-muted; margin-top: 1; }
     .chat-log { height: 1fr; border: solid $secondary; background: $surface-darken-1; }
     #system-log { height: 1fr; border: solid $secondary; background: $surface-darken-1; min-height: 8; }
     #bbs-container { height: 1fr; layout: vertical; padding: 1; }
@@ -1244,17 +1249,18 @@ class RetiSpeakeasyApp(App):
                 yield Label("Initializing...", id="hash-label", classes="status-pill")
                 yield Label(" Connected Host", classes="widget-header")
                 yield Label("None", id="host-label", classes="status-pill")
-                yield Button(" Select Host (H)", id="btn-host-open", classes="sidebar-btn", variant="primary")
-                yield Button(" Edit Profile (P)", id="btn-profile-open", classes="sidebar-btn", variant="default")
-                yield Button(" New Bulletin (B)", id="btn-bulletin-open", classes="sidebar-btn", variant="success")
-                yield Button(" Request Channel (N)", id="btn-channel-open", classes="sidebar-btn", variant="warning")
-                yield Button(" Manage Channels (M)", id="btn-channel-manage", classes="sidebar-btn", variant="primary")
-                yield Button(" Purge Local Channel (X)", id="btn-channel-purge", classes="sidebar-btn", variant="error")
-                yield Button(" Restore Channel (R)", id="btn-channel-restore", classes="sidebar-btn", variant="success")
-                yield Button(" New Calendar Event (C)", id="btn-calendar-open", classes="sidebar-btn", variant="primary")
+                yield Label("Shortcuts: H host • P profile • B bulletin • M channels", classes="hint-text")
+                yield Button(" Connect / Switch Host", id="btn-host-open", classes="sidebar-btn", variant="primary")
+                yield Button(" Manage Channels", id="btn-channel-manage", classes="sidebar-btn", variant="default")
+                yield Button(" New Bulletin", id="btn-bulletin-open", classes="sidebar-btn", variant="success")
+                yield Button(" Request Channel", id="btn-channel-open", classes="sidebar-btn", variant="warning")
+                yield Button(" Purge / Restore", id="btn-channel-purge", classes="sidebar-btn secondary")
                 yield Label(" System Log", classes="widget-header")
                 yield RichLog(id="system-log", classes="chat-log", highlight=True, markup=True)
             with Vertical(id="main-area"):
+                with Vertical(id="main-banner"):
+                    yield Label("Speakeasy • Federated bulletin board", classes="main-banner-title")
+                    yield Label("No host connected yet. Pick a hub to begin syncing channels and messages.", id="main-banner-status", classes="main-banner-subtitle")
                 with TabbedContent(id="channel-tabs"):
                     for chan in db_chans:
                         chan_name = chan["name"] if isinstance(chan, dict) else str(chan)
@@ -1271,11 +1277,12 @@ class RetiSpeakeasyApp(App):
                                 yield RichLog(id=f"calendar-log-{clean_id}", classes="chat-log", highlight=True, markup=True)
                     with TabPane(" Bulletin Board", id="tab-bbs"):
                         with Vertical(id="bbs-container"):
+                            yield Label(" Bulletin Board", classes="widget-header")
                             with Horizontal(id="bbs-top-bar"):
                                 yield Button(" Post New Bulletin", id="btn-bbs-post", variant="success")
                             yield DataTable(id="bbs-table")
                             yield RichLog(id="bbs-viewer", classes="chat-log", highlight=True, markup=True)
-                yield Input(placeholder="Message, or /block /unblock /blocked /dropchannel <name> /restorechannel <name>",
+                yield Input(placeholder="Type a message or use /commands for moderation",
                             id="chat-input")
         yield Footer()
 
@@ -1330,12 +1337,19 @@ class RetiSpeakeasyApp(App):
 
     def reload_bulletin_board(self) -> None:
         table = self.query_one("#bbs-table", DataTable)
+        viewer = self.query_one("#bbs-viewer", RichLog)
         table.clear()
         bulletins = self.engine.db.get_bulletins()
+        if not bulletins:
+            viewer.clear()
+            viewer.write("[dim]No bulletins yet. Post the first one to start the board.[/]")
+            return
+        viewer.clear()
         for b in bulletins:
             author = b.get("alias") or b["author_hash"][:10]
             date_str = datetime.datetime.fromtimestamp(b["timestamp"]).strftime("%Y-%m-%d %H:%M")
             table.add_row(b["title"], author, date_str, key=b["bulletin_id"])
+            viewer.write(f"[bold cyan]{escape(b['title'])}[/] — {escape(author)} — {escape(date_str)}")
 
     def on_data_table_row_selected(self, event: DataTable.RowSelected) -> None:
         if event.data_table.id == "bbs-table":
@@ -1760,6 +1774,12 @@ class RetiSpeakeasyApp(App):
                 "/dropchannel <name>, /restorechannel <name>"
             )
 
+    def _set_banner_status(self, text: str) -> None:
+        try:
+            self.query_one("#main-banner-status", Label).update(text)
+        except Exception:
+            pass
+
     def handle_engine_event(self, event_type: str, data) -> None:
         def update_ui() -> None:
             if event_type == "system":
@@ -1787,10 +1807,13 @@ class RetiSpeakeasyApp(App):
                         if last_seen:
                             age = human_age(time.time() - float(last_seen))
                             self.query_one("#host-label", Label).update(f"[bold green]{escape(str(display))}[/] (seen {age})")
+                            self._set_banner_status(f"Connected to {escape(str(display))} • seen {age}")
                         else:
                             self.query_one("#host-label", Label).update(f"[bold green]{escape(str(display))}[/]")
+                            self._set_banner_status(f"Connected to {escape(str(display))}")
                     else:
                         self.query_one("#host-label", Label).update(f"[bold green]{escape(str(data))}[/]")
+                        self._set_banner_status(f"Connected to {escape(str(data))}")
                 except Exception:
                     pass
 
