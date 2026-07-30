@@ -6,13 +6,16 @@ The daemon is exercised without a live Reticulum stack: `on_peer_announce` and
 enough to drive directly.
 """
 
+from types import SimpleNamespace
+
 import msgpack
 import RNS
 import pytest
 
 import speakeasy_daemon
+from fed_engine import Opcode, S2SProtocolEngine, WireCodec
 from speakeasy_daemon import HubAnnounceHandler, SpeakeasyDaemon
-from speakeasy_db import SpeakeasyDB
+from speakeasy_db import BandwidthClass, SpeakeasyDB
 
 
 class FakeLink:
@@ -36,6 +39,12 @@ def daemon(tmp_path):
     instance.settlement_delay = 0
     instance.auto_discover_peers = True
     instance.linked = []
+    instance.channel_presence_cache = {}
+    instance.s2s_engine = S2SProtocolEngine(
+        db=instance.db,
+        local_hash_bytes=instance.identity.hash,
+        bandwidth_class=BandwidthClass.HIGH_SPEED,
+    )
     instance._link_to = lambda identity, label: instance.linked.append(label)
     yield instance
     instance.db.close()
@@ -106,3 +115,19 @@ def test_discovery_can_be_disabled(daemon):
     daemon.connect_discovered_peers()
 
     assert daemon.linked == []
+
+
+def test_channel_poll_responses_are_cached_for_relay_choices(daemon):
+    peer_identity = RNS.Identity()
+    link = FakeLink(peer_identity)
+    daemon.active_links = [link]
+
+    response = WireCodec.pack(
+        Opcode.CHANNEL_POLL_RESP,
+        peer_identity.hash,
+        {0: "lounge", 1: True},
+    )
+    daemon._on_packet_received(response, SimpleNamespace(link=link))
+
+    assert daemon.should_relay_channel_to_peer("lounge", link) is False
+    assert daemon.should_relay_channel_to_peer("events", link) is True

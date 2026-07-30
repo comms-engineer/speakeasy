@@ -15,6 +15,7 @@ from fed_engine import (
     MAX_SYNC_EPOCHS,
     Opcode,
     S2SProtocolEngine,
+    WireCodec,
 )
 from operator_iface import OperatorInterface
 from speakeasy_db import BandwidthClass, SpeakeasyDB, DEFAULT_EPOCH_BUCKET_SEC
@@ -119,6 +120,7 @@ class SpeakeasyDaemon:
         self.started_at = time.time()
         self.operator_bootstrap_pending = False
         self.operator_bootstrap_retry_at = 0.0
+        self.channel_presence_cache: dict[tuple[str, str], bool] = {}
 
         node_cfg = self.config.get("node", {})
         fed_cfg = self.config.get("federation", {})
@@ -361,6 +363,25 @@ class SpeakeasyDaemon:
             self._send_frames(link, frames)
         return len(peers)
 
+    def should_relay_channel_to_peer(self, channel_name: str, link) -> bool:
+        if not channel_name:
+            return False
+        key = (str(channel_name).lstrip("#"), self._peer_key(link))
+        if key in self.channel_presence_cache:
+            return not self.channel_presence_cache[key]
+        return True
+
+    def _peer_key(self, link) -> str:
+        remote = getattr(link, "get_remote_identity", lambda: None)()
+        if remote is not None:
+            return remote.hash.hex()
+        return str(id(link))
+
+    def _remember_channel_presence(self, channel_name: str, link, present: bool) -> None:
+        if not channel_name:
+            return
+        self.channel_presence_cache[(str(channel_name).lstrip("#"), self._peer_key(link))] = bool(present)
+
     def _on_remote_identified(self, link, remote_identity):
         if remote_identity and blackhole.is_blocked(remote_identity.hash, self.db):
             # A link identifies after establishment, so this is the first point
@@ -422,6 +443,15 @@ class SpeakeasyDaemon:
             if result.accepted_channels:
                 relay_frames += self.s2s_engine.build_channel_frames(result.accepted_channels, hop_count=1)
 
+            if result.opcode == Opcode.CHANNEL_POLL_RESP:
+                try:
+                    _, _, _, payload = WireCodec.unpack(message)
+                except Exception:
+                    payload = {}
+                channel_name = str(payload.get(0) or payload.get("0") or "")
+                present = bool(payload.get(1) or payload.get("1") or False)
+                self._remember_channel_presence(channel_name, packet.link, present)
+
             peer_count = self._broadcast(relay_frames, exclude_link=packet.link)
             if peer_count and relay_frames:
                 logger.info(f"Relayed {len(relay_frames)} verified frame(s) to {peer_count} peer link(s).")
@@ -454,10 +484,16 @@ class SpeakeasyDaemon:
             request.get("description") or "",
             requester_hash=request.get("requester_hash"),
         )
-        peers = self._broadcast([frame], exclude_link=exclude_link)
+        peers = [
+            link for link in self.active_links
+            if link is not exclude_link and link.status == RNS.Link.ACTIVE
+            and self.should_relay_channel_to_peer(request["name"], link)
+        ]
+        for link in peers:
+            self._send_frames(link, [frame])
         if peers:
             logger.info(
-                f"Relayed channel nomination #{request['name']} to {peers} peer link(s)."
+                f"Relayed channel nomination #{request['name']} to {len(peers)} peer link(s)."
             )
 
     def _notify_operator_startup(self):
