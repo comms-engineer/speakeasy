@@ -1108,7 +1108,7 @@ class RetiSpeakeasyApp(App):
         yield Header(show_clock=True)
 
         startup_db = SpeakeasyDB(client_db_path())
-        db_chans = startup_db.get_channels()
+        db_chans = startup_db.get_channels_with_local_data()
         startup_db.close()
 
         with Horizontal():

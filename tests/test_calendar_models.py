@@ -36,8 +36,7 @@ def test_calendar_ui_components_are_present():
             }
             assert "btn-calendar-open" in widget_ids
             assert "btn-channel-purge" in widget_ids
-            assert any(widget_id.startswith("calendar-log-") for widget_id in widget_ids)
-            assert any(widget_id.startswith("calendar-table-") for widget_id in widget_ids)
+            assert "tab-bbs" in widget_ids
 
     App.run_test = App.run_test
     import asyncio
@@ -56,10 +55,12 @@ def test_calendar_tui_supports_edit_and_delete_controls():
         self.active_host_link = None
         self.s2s_engine = None
         self.host_channels = set()
+        self.current_host_hash = None
 
     async def check_components() -> None:
         with patch("reti_speakeasy.ReticulumEngine.__init__", fake_engine_init):
             async with app.run_test():
+                app.sync_channel_tabs(["general"])
                 widget_ids = {
                     widget.id
                     for widget in app.query("*")
@@ -94,6 +95,28 @@ def test_channel_tabs_have_their_own_calendar_panels(tmp_path):
             startup_db = SpeakeasyDB(str(db_path))
             startup_db.add_channel("general", "Channel #general")
             startup_db.add_channel("tech", "Channel #tech")
+            startup_db.create_calendar(Calendar(
+                calendar_id="general",
+                name="General",
+                description="",
+                owner_hash="owner-1",
+                visibility="public",
+                timezone="UTC",
+                channel="general",
+                created_at=1710000000,
+                updated_at=1710000000,
+            ))
+            startup_db.create_calendar(Calendar(
+                calendar_id="tech",
+                name="Tech",
+                description="",
+                owner_hash="owner-1",
+                visibility="public",
+                timezone="UTC",
+                channel="tech",
+                created_at=1710000000,
+                updated_at=1710000000,
+            ))
             startup_db.close()
             async with app.run_test():
                 widget_ids = {
@@ -238,6 +261,49 @@ def test_get_channels_with_local_data_excludes_empty_channels(tmp_path):
         assert "empty" not in names
     finally:
         db.close()
+
+
+def test_startup_only_renders_tabs_for_channels_with_local_data(tmp_path):
+    app = RetiSpeakeasyApp()
+    db_path = tmp_path / "startup-visible-tabs.db"
+
+    startup_db = SpeakeasyDB(str(db_path))
+    startup_db.add_channel("general", "Channel #general")
+    startup_db.add_channel("parlor", "Channel #parlor")
+    startup_db.create_calendar(Calendar(
+        calendar_id="general",
+        name="General",
+        description="",
+        owner_hash="owner-1",
+        visibility="public",
+        timezone="UTC",
+        channel="general",
+        created_at=1710000000,
+        updated_at=1710000000,
+    ))
+    startup_db.close()
+
+    def fake_engine_init(self, ui_callback=None):
+        self.ui_callback = ui_callback
+        self.hash_str = "test-hash"
+        self.db = SpeakeasyDB(str(db_path))
+        self.identity = SimpleNamespace(hash=SimpleNamespace(hex=lambda: "test-identity"))
+        self.host_manager = None
+        self.active_host_link = None
+        self.s2s_engine = None
+        self.host_channels = set()
+        self.current_host_hash = None
+
+    async def check_startup_tabs() -> None:
+        with patch("reti_speakeasy.ReticulumEngine.__init__", fake_engine_init), \
+             patch("reti_speakeasy.client_db_path", return_value=str(db_path)):
+            async with app.run_test() as pilot:
+                await pilot.pause()
+                assert len(list(app.query("#tab-general"))) == 1
+                assert len(list(app.query("#tab-parlor"))) == 0
+
+    import asyncio
+    asyncio.run(check_startup_tabs())
 
 
 def test_calendar_and_event_models_round_trip():
