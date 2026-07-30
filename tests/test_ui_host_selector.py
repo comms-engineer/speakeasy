@@ -1,7 +1,7 @@
 import sqlite3
 from types import SimpleNamespace
 from channel_summary import build_channel_summary
-from reti_speakeasy import HostSelectorModal, HostManager
+from reti_speakeasy import HostSelectorModal, HostManager, RetiSpeakeasyApp
 
 
 def test_host_selector_populates_table(monkeypatch):
@@ -114,6 +114,14 @@ def test_host_manager_tolerates_closed_db_during_ranking():
     ranked = hm.get_ranked_hosts()
 
     assert ranked[0]["channel_affinity"] == 0
+
+
+def test_action_quit_is_resilient_to_engine_shutdown_errors(monkeypatch):
+    app = RetiSpeakeasyApp()
+    app.engine = SimpleNamespace(shutdown=lambda: (_ for _ in ()).throw(RuntimeError("boom")))
+    monkeypatch.setattr(app, "exit", lambda: None)
+
+    app.action_quit()
 
 
 def test_host_selector_channel_filter_uses_summary():

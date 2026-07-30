@@ -1070,16 +1070,25 @@ class ReticulumEngine:
         self._stopped = True
         self.auto_failover_enabled = False
         try:
-            self.host_manager.stop_prober()
+            if getattr(self, "_connect_thread", None) and self._connect_thread.is_alive():
+                self._connect_thread.join(timeout=0.2)
         except Exception:
             pass
         try:
-            if self.active_host_link:
+            host_manager = getattr(self, "host_manager", None)
+            if host_manager is not None:
+                host_manager.stop_prober()
+        except Exception:
+            pass
+        try:
+            if getattr(self, "active_host_link", None) is not None:
                 self.active_host_link.teardown()
         except Exception:
             pass
         try:
-            self.db.close()
+            db = getattr(self, "db", None)
+            if db is not None:
+                db.close()
         except Exception:
             pass
 
@@ -1789,8 +1798,18 @@ class RetiSpeakeasyApp(App):
                 self.notify("You can only delete events you created or own.", severity="error")
 
     def action_quit(self) -> None:
-        self.engine.shutdown()
-        super().action_quit()
+        try:
+            engine = getattr(self, "engine", None)
+            if engine is not None:
+                shutdown = getattr(engine, "shutdown", None)
+                if callable(shutdown):
+                    shutdown()
+        except Exception:
+            pass
+        try:
+            self.exit()
+        except Exception:
+            pass
 
     def handle_command(self, text: str) -> None:
         command, _, argument = text[1:].partition(" ")
