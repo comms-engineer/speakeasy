@@ -120,6 +120,44 @@ python speakeasy_admin.py block spam
 `pause` keeps a channel defined but refuses traffic, `resume` re-enables it, and
 `block` refuses both traffic and future requests for that channel.
 
+### Operator Management Over LXMF
+
+When `moderation.operator_lxmf_hash` is configured, the daemon starts an LXMF control endpoint
+and sends an automatic startup heartbeat (`Speakeasy online`) to the configured operator hash.
+If the route to the operator is not ready yet, the node retries delivery every 30 seconds until
+it succeeds. This creates or refreshes a message thread in your LXMF client so operator actions
+can stay in one place.
+
+#### LXMF command reference
+
+Send one command per line in the LXMF thread; multiple lines are processed in order.
+
+| Command | Effect |
+| --- | --- |
+| `help` or `?` | Show full command help |
+| `status` or `stats` | Node status (uptime, links, channel state counts, pending requests) |
+| `pending` or `requests` | List pending channel nominations |
+| `channels` | List channels and status (`active`, `paused`, `blocked`) |
+| `approve <channel>` | Approve queued request and propagate signed channel add |
+| `deny <channel>` | Deny queued request |
+| `add <channel> [description]` | Create + approve channel immediately |
+| `pause <channel>` | Keep channel but refuse traffic |
+| `resume <channel>` | Re-enable channel traffic |
+| `block <channel>` | Refuse channel traffic and future channel requests |
+
+#### Example LXMF session
+
+```text
+status
+pending
+approve lounge
+pause off-topic
+channels
+```
+
+Command authorization is strict: only messages received from the exact configured
+`moderation.operator_lxmf_hash` are accepted. Messages from any other LXMF identity are ignored.
+
 > **Not yet verified on real hardware:** the LXMF path has only been smoke-tested — the
 > endpoint starts and announces, and the source-hash authorisation is in place, but issuing
 > `approve <channel>` from a second live LXMF peer (Sideband, MeshChat) has not been
@@ -240,7 +278,7 @@ instead of storing a message nobody will ever receive.
 | `channels.allowed_channels` | Channels this hub hosts; operator-approved channels are accepted on top of this |
 | `moderation.accept_channel_requests` | Whether clients may queue channel requests |
 | `moderation.receive_federated_channel_nominations` | Whether this hub accepts channel nominations relayed from federated peers |
-| `moderation.operator_lxmf_hash` | LXMF address paged for approvals; the only source accepted for `approve`/`deny` |
+| `moderation.operator_lxmf_hash` | LXMF address for operator control; the only source accepted for LXMF management commands |
 | `channels.channel_blocklist` | Channels rejected outright |
 | `channels.max_message_bytes` | Maximum message size accepted or signed (capped at `MAX_MESSAGE_CONTENT_BYTES` so a record always fits one frame) |
 | `storage.db_filename` | Database name inside `~/.reti_speakeasy` |

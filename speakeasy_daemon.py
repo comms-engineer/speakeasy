@@ -81,6 +81,9 @@ class SpeakeasyDaemon:
         self.propagated_channels = set()
         self.channels_seeded = False
         self.sync_offset = 0
+        self.started_at = time.time()
+        self.operator_bootstrap_pending = False
+        self.operator_bootstrap_retry_at = 0.0
 
         node_cfg = self.config.get("node", {})
         fed_cfg = self.config.get("federation", {})
@@ -205,6 +208,7 @@ class SpeakeasyDaemon:
                         "use speakeasy_admin.py to review channel requests.")
 
         self.announce_host()
+        self._notify_operator_startup()
 
     def build_announce_payload(self) -> bytes:
         """Serializes host telemetry into a compact msgpack payload (< 128 bytes)."""
@@ -421,6 +425,77 @@ class SpeakeasyDaemon:
                 f"Relayed channel nomination #{request['name']} to {peers} peer link(s)."
             )
 
+    def _notify_operator_startup(self):
+        if not self.operator:
+            return
+
+        active = len(self.db.get_active_channel_names())
+        blocked = len([c for c in self.db.get_channels() if (c.get("status") or "active") == "blocked"])
+        body = (
+            f"{self.node_name} is alive.\n"
+            f"Node hash: {self.identity.hash.hex()[:16]}\n"
+            f"Active links: {len(self.active_links)}/{self.max_clients}\n"
+            f"Channels: {active} active, {blocked} blocked\n\n"
+            f"Reply with 'help' for operator commands."
+        )
+
+        if self.operator.notify("Speakeasy online", body):
+            self.operator_bootstrap_pending = False
+            logger.info("Sent startup heartbeat to operator over LXMF.")
+            return
+
+        self.operator_bootstrap_pending = True
+        self.operator_bootstrap_retry_at = time.time() + 30.0
+        logger.info("Startup heartbeat to operator queued for retry.")
+
+    def _maybe_retry_operator_startup_notice(self):
+        if not self.operator or not self.operator_bootstrap_pending:
+            return
+        if time.time() < self.operator_bootstrap_retry_at:
+            return
+        self._notify_operator_startup()
+        if self.operator_bootstrap_pending:
+            self.operator_bootstrap_retry_at = time.time() + 30.0
+
+    def _operator_help_text(self) -> str:
+        return (
+            "Commands:\n"
+            "help\n"
+            "status\n"
+            "pending (alias: requests)\n"
+            "channels\n"
+            "approve <channel>\n"
+            "deny <channel>\n"
+            "add <channel> [description]\n"
+            "pause <channel>\n"
+            "resume <channel>\n"
+            "block <channel>"
+        )
+
+    def _operator_status_text(self) -> str:
+        uptime_sec = int(max(0, time.time() - self.started_at))
+        h = uptime_sec // 3600
+        m = (uptime_sec % 3600) // 60
+        s = uptime_sec % 60
+        uptime = f"{h:02d}:{m:02d}:{s:02d}"
+
+        channels = self.db.get_channels()
+        active = sum(1 for c in channels if str(c.get("status") or "active").lower() == "active")
+        paused = sum(1 for c in channels if str(c.get("status") or "active").lower() == "paused")
+        blocked = sum(1 for c in channels if str(c.get("status") or "active").lower() == "blocked")
+        pending = len(self.db.get_channel_requests("pending"))
+        endpoint = self.operator.endpoint_hash()[:16] if self.operator else "unavailable"
+
+        return (
+            f"Node: {self.node_name}\n"
+            f"Uptime: {uptime}\n"
+            f"LXMF endpoint: {endpoint}\n"
+            f"Links: {len(self.active_links)}/{self.max_clients}\n"
+            f"Discovered peers: {len(self.discovered_peers)}\n"
+            f"Channels: {active} active, {paused} paused, {blocked} blocked\n"
+            f"Pending channel requests: {pending}"
+        )
+
     def approve_channel(self, name: str) -> str:
         pending = {r["name"]: r for r in self.db.get_channel_requests("pending")}
         description = (pending.get(name) or {}).get("description") or f"Channel #{name}"
@@ -485,6 +560,10 @@ class SpeakeasyDaemon:
         return f"No pending request for #{name}."
 
     def handle_operator_command(self, command: str, argument: str) -> str:
+        if command in {"help", "?"}:
+            return self._operator_help_text()
+        if command in {"status", "stats"}:
+            return self._operator_status_text()
         if command == "approve" and argument:
             return self.approve_channel(argument.lstrip("#"))
         if command == "deny" and argument:
@@ -498,7 +577,7 @@ class SpeakeasyDaemon:
             return self.resume_channel(argument)
         if command == "block" and argument:
             return self.block_channel(argument)
-        if command == "pending":
+        if command in {"pending", "requests"}:
             requests = self.db.get_channel_requests("pending")
             if not requests:
                 return "No pending channel requests."
@@ -635,6 +714,7 @@ class SpeakeasyDaemon:
         last_prune = 0.0
         while self.running:
             now = time.time()
+            self._maybe_retry_operator_startup_notice()
             if now - last_sync >= self.sync_interval:
                 self.maintain_static_peers()
                 self.connect_discovered_peers()

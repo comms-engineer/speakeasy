@@ -19,8 +19,9 @@ logger = logging.getLogger("speakeasy_daemon.operator")
 
 DISPLAY_NAME = "Speakeasy Hub"
 USAGE = (
-    "Commands: approve <channel> | deny <channel> | add <channel> [description] | "
-    "pause <channel> | resume <channel> | block <channel> | pending | channels"
+    "Commands: help | status | pending | channels | requests | "
+    "approve <channel> | deny <channel> | add <channel> [description] | "
+    "pause <channel> | resume <channel> | block <channel>"
 )
 
 
@@ -87,6 +88,13 @@ class OperatorInterface:
                 f"Description: {description or '(none)'}\n\n"
             f"Reply 'approve {name}', 'deny {name}', or pre-create with 'add {name}'.")
         return self.notify("Channel request", body)
+
+    def endpoint_hash(self) -> str:
+        """LXMF endpoint hash used by this node for operator control."""
+        try:
+            return self.local_destination.hash.hex()
+        except Exception:
+            return ""
 
     def _on_lxmf_delivery(self, message):
         source_hash = message.source_hash
