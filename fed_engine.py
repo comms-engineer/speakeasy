@@ -114,6 +114,7 @@ class S2SProtocolEngine:
     def __init__(self, db: SpeakeasyDB, local_hash_bytes: bytes, bandwidth_class: BandwidthClass,
                  allowed_channels: Optional[Set[str]] = None, channel_blocklist: Optional[Set[str]] = None,
                  accept_channel_requests: bool = False,
+                 receive_federated_channel_nominations: bool = True,
                  sync_history_days: float = DEFAULT_SYNC_HISTORY_DAYS):
         self.db = db
         self.sync_history_days = float(sync_history_days)
@@ -122,6 +123,7 @@ class S2SProtocolEngine:
         self.allowed_channels = set(allowed_channels) if allowed_channels else None
         self.channel_blocklist = set(channel_blocklist or ())
         self.accept_channel_requests = accept_channel_requests
+        self.receive_federated_channel_nominations = bool(receive_federated_channel_nominations)
         self.seen_msg_ids: OrderedDict = OrderedDict()
         self.deferred_messages: OrderedDict = OrderedDict()
 
@@ -217,8 +219,11 @@ class S2SProtocolEngine:
         wanted = [bytes.fromhex(h) for h in dict.fromkeys(identity_hashes)]
         return WireCodec.pack(Opcode.IDENTITY_REQ, self.local_hash_bytes, {0: wanted})
 
-    def build_channel_req(self, channel_name: str, description: str) -> bytes:
+    def build_channel_req(self, channel_name: str, description: str,
+                          requester_hash: Optional[str] = None) -> bytes:
         payload = {0: channel_name, 1: description}
+        if requester_hash:
+            payload[2] = bytes.fromhex(requester_hash)
         return WireCodec.pack(Opcode.CHANNEL_REQ, self.local_hash_bytes, payload)
 
     def build_hello(self, active_channels: list[str]) -> bytes:
@@ -507,22 +512,39 @@ class S2SProtocolEngine:
                 result.accepted_channels.append(chan_name)
 
         elif opcode == Opcode.CHANNEL_REQ:
-            chan_name = str(payload[0])
-            desc = str(payload[1] or "")
+            if isinstance(payload, dict):
+                chan_name = str(payload.get(0) or payload.get("0") or "")
+                desc = str(payload.get(1) or payload.get("1") or "")
+                requester_payload = payload.get(2) or payload.get("2")
+            else:
+                chan_name = str(payload[0]) if len(payload) > 0 else ""
+                desc = str(payload[1] or "") if len(payload) > 1 else ""
+                requester_payload = payload[2] if len(payload) > 2 else None
+
+            requester_hash = origin_hash.hex()
+            if isinstance(requester_payload, bytes):
+                requester_hash = requester_payload.hex()
+            is_federated_nomination = requester_hash != origin_hash.hex()
+
             if self._refuse_blackholed(origin_hash.hex(), f"channel request #{chan_name}"):
                 return result
             if not self.accept_channel_requests:
                 logger.info(f"Ignored channel request for #{chan_name}: this node does not take requests")
+            elif is_federated_nomination and not self.receive_federated_channel_nominations:
+                logger.info(
+                    f"Ignored federated channel nomination for #{chan_name}: "
+                    f"receive_federated_channel_nominations is disabled"
+                )
             elif self.db.get_channel_status(chan_name) == "blocked":
                 logger.info(f"Ignored channel request for #{chan_name}: channel is blocked")
             elif chan_name in self.channel_blocklist:
                 logger.info(f"Ignored channel request for #{chan_name}: blocklisted")
-            elif self.db.add_channel_request(chan_name, desc, origin_hash.hex()):
-                logger.info(f"Queued channel request for #{chan_name} from {origin_hash.hex()[:10]}")
+            elif self.db.add_channel_request(chan_name, desc, requester_hash):
+                logger.info(f"Queued channel request for #{chan_name} from {requester_hash[:10]}")
                 result.channel_requests.append({
                     "name": chan_name,
                     "description": desc,
-                    "requester_hash": origin_hash.hex(),
+                    "requester_hash": requester_hash,
                 })
 
         elif opcode == Opcode.IDENTITY_PUSH:

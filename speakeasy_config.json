@@ -24,6 +24,7 @@
   },
   "moderation": {
     "accept_channel_requests": true,
+    "receive_federated_channel_nominations": true,
     "operator_lxmf_hash": ""
   },
   "storage": {

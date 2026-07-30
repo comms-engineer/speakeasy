@@ -17,7 +17,8 @@ from speakeasy_db import BandwidthClass, SpeakeasyDB
 
 
 class Node:
-    def __init__(self, path, allowed_channels=None, accept_channel_requests=False):
+    def __init__(self, path, allowed_channels=None, accept_channel_requests=False,
+                 receive_federated_channel_nominations=True):
         self.identity = RNS.Identity()
         self.db = SpeakeasyDB(str(path))
         self.db.add_channel("parlor", "test channel")
@@ -27,6 +28,7 @@ class Node:
             bandwidth_class=BandwidthClass.HIGH_SPEED,
             allowed_channels=allowed_channels,
             accept_channel_requests=accept_channel_requests,
+            receive_federated_channel_nominations=receive_federated_channel_nominations,
         )
 
     def deliver(self, frame):
@@ -191,6 +193,40 @@ def test_channel_requests_are_ignored_for_blocked_channels(hub, bob):
 
     assert result.channel_requests == []
     assert hub.db.get_channel_requests("pending") == []
+
+
+def test_federated_channel_nomination_preserves_original_requester(tmp_path, hub, bob):
+    peer = Node(tmp_path / "peer.db", accept_channel_requests=True)
+    try:
+        relay = hub.engine.build_channel_req(
+            "lounge", "off-topic chatter", requester_hash=bob.identity.hash.hex()
+        )
+        result = peer.deliver(relay)
+
+        assert len(result.channel_requests) == 1
+        assert result.channel_requests[0]["requester_hash"] == bob.identity.hash.hex()
+        pending = peer.db.get_channel_requests("pending")
+        assert pending[0]["requester_hash"] == bob.identity.hash.hex()
+    finally:
+        peer.close()
+
+
+def test_federated_channel_nomination_can_be_disabled(tmp_path, hub, bob):
+    peer = Node(
+        tmp_path / "peer-disabled.db",
+        accept_channel_requests=True,
+        receive_federated_channel_nominations=False,
+    )
+    try:
+        relay = hub.engine.build_channel_req(
+            "lounge", "off-topic chatter", requester_hash=bob.identity.hash.hex()
+        )
+        result = peer.deliver(relay)
+
+        assert result.channel_requests == []
+        assert peer.db.get_channel_requests("pending") == []
+    finally:
+        peer.close()
 
 
 def test_duplicate_channel_requests_do_not_stack(hub, bob):

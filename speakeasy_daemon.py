@@ -112,6 +112,9 @@ class SpeakeasyDaemon:
         mod_cfg = self.config.get("moderation", {})
         self.operator_lxmf_hash = mod_cfg.get("operator_lxmf_hash") or ""
         self.accept_channel_requests = bool(mod_cfg.get("accept_channel_requests", True))
+        self.receive_federated_channel_nominations = bool(
+            mod_cfg.get("receive_federated_channel_nominations", True)
+        )
         self.auto_discover_peers = bool(fed_cfg.get("auto_discover_peers", True))
 
         # 1. Initialize DB & Reticulum Stack
@@ -169,6 +172,7 @@ class SpeakeasyDaemon:
             allowed_channels=self.allowed_channels or None,
             channel_blocklist=self.channel_blocklist,
             accept_channel_requests=self.accept_channel_requests,
+            receive_federated_channel_nominations=self.receive_federated_channel_nominations,
             sync_history_days=self.sync_history_days,
         )
         self._rebuild_channel_policy()
@@ -376,6 +380,7 @@ class SpeakeasyDaemon:
 
             for request in result.channel_requests:
                 self._notify_operator_of_request(request)
+                self._relay_channel_request(request, exclude_link=packet.link)
 
         except Exception as e:
             logger.error(f"Error processing inbound frame: {e}", exc_info=True)
@@ -394,6 +399,18 @@ class SpeakeasyDaemon:
         else:
             logger.info(f"Channel request #{request['name']} is pending operator review "
                         f"(no operator notification delivered).")
+
+    def _relay_channel_request(self, request: dict, exclude_link=None):
+        frame = self.s2s_engine.build_channel_req(
+            request["name"],
+            request.get("description") or "",
+            requester_hash=request.get("requester_hash"),
+        )
+        peers = self._broadcast([frame], exclude_link=exclude_link)
+        if peers:
+            logger.info(
+                f"Relayed channel nomination #{request['name']} to {peers} peer link(s)."
+            )
 
     def approve_channel(self, name: str) -> str:
         pending = {r["name"]: r for r in self.db.get_channel_requests("pending")}

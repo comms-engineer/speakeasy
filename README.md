@@ -92,6 +92,12 @@ key-to-hash binding before adding it, accept it even if their own `allowed_chann
 predates the approval, and ignore replays, so the same approval circulating around a mesh
 converges instead of looping.
 
+Channel nominations are federated to peer hubs by default: when one hub accepts a
+`CHANNEL_REQ`, it relays the nomination (including the original requester hash) so other
+operators can review the same request independently for their own hub. Set
+`moderation.receive_federated_channel_nominations` to `false` to opt out of receiving
+federated nominations while still handling local client requests.
+
 Approval happens over LXMF when `moderation.operator_lxmf_hash` is set: the hub messages the
 operator on each request and accepts `approve <channel>` / `deny <channel>` replies **only**
 from that exact source hash. Otherwise use the CLI, which drives the same queue:
@@ -227,6 +233,7 @@ instead of storing a message nobody will ever receive.
 | `federation.auto_discover_peers` | Federate with any hub heard announcing, not just `static_peers` |
 | `channels.allowed_channels` | Channels this hub hosts; operator-approved channels are accepted on top of this |
 | `moderation.accept_channel_requests` | Whether clients may queue channel requests |
+| `moderation.receive_federated_channel_nominations` | Whether this hub accepts channel nominations relayed from federated peers |
 | `moderation.operator_lxmf_hash` | LXMF address paged for approvals; the only source accepted for `approve`/`deny` |
 | `channels.channel_blocklist` | Channels rejected outright |
 | `channels.max_message_bytes` | Maximum message size accepted or signed (capped at `MAX_MESSAGE_CONTENT_BYTES` so a record always fits one frame) |
