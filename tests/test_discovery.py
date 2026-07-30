@@ -108,6 +108,25 @@ def test_discovery_respects_capacity(daemon):
     assert daemon.linked == []
 
 
+def test_discovered_peers_are_prioritized_by_channel_affinity(daemon):
+    alpha = RNS.Identity()
+    beta = RNS.Identity()
+    daemon.discovered_peers = {
+        beta.hash.hex(): beta,
+        alpha.hash.hex(): alpha,
+    }
+    daemon.peer_channel_cache = {
+        alpha.hash.hex(): {"lounge", "events"},
+        beta.hash.hex(): {"lounge"},
+    }
+    daemon.db.add_channel("lounge", "test")
+    daemon.db.add_channel("events", "test")
+
+    daemon.connect_discovered_peers()
+
+    assert daemon.linked == [alpha.hash.hex(), beta.hash.hex()]
+
+
 def test_discovery_can_be_disabled(daemon):
     announce(daemon)
     daemon.auto_discover_peers = False

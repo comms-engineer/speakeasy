@@ -260,6 +260,7 @@ class HostManager:
     def get_ranked_hosts(self) -> list:
         now = time.time()
         ranked = []
+        local_channels = set(self.db.get_active_channel_names()) if self.db else set()
         for host in list(self.hosts.values()):
             # Keep previously discovered hosts visible to the UI and the caller.
             # Stale-host cleanup is handled by the DB layer separately so this
@@ -270,6 +271,14 @@ class HostManager:
                 host.get("max_load", 10),
                 host.get("last_seen", now),
             )
+            metadata = host.get("metadata") or {}
+            peer_channels = set()
+            if isinstance(metadata.get("channels"), (list, tuple, set)):
+                peer_channels = {str(c).lstrip("#") for c in metadata["channels"] if c}
+            elif isinstance(metadata.get("chs"), (bytes, bytearray)):
+                # Keep the UI deterministic even when the announce summary is probabilistic.
+                peer_channels = set()
+            host["channel_affinity"] = len(local_channels & peer_channels)
             ranked.append(host)
 
         return sorted(ranked, key=lambda x: x.get("score", 0.0), reverse=True)
@@ -679,13 +688,17 @@ class HostSelectorModal(ModalScreen[str]):
         margin-bottom: 1;
     }
     #hosts-table {
-        height: 7;
+        height: 8;
         margin-bottom: 1;
     }
     #channel-filter {
         margin-bottom: 1;
     }
     #filter-hint {
+        color: $text-muted;
+        margin-bottom: 1;
+    }
+    #modal-title-sub {
         color: $text-muted;
         margin-bottom: 1;
     }
@@ -709,11 +722,12 @@ class HostSelectorModal(ModalScreen[str]):
     def compose(self) -> ComposeResult:
         with Vertical(id="dialog"):
             yield Label(" Select Host Entrypoint", id="modal-title")
+            yield Label(" Pick a hub entrypoint to connect to.", id="modal-title-sub")
             yield DataTable(id="hosts-table")
             yield Input(placeholder="Filter hubs by channel (likely match)", id="channel-filter")
-            yield Label(" Channel filter uses announce summaries (likely match). Exact channels are verified after connect.",
+            yield Label(" Filter uses announce summaries; exact channels are verified after connect.",
                         id="filter-hint")
-            yield Input(placeholder="Or enter manual 32-char hex hash...", id="manual-input")
+            yield Input(placeholder="Or enter a manual 32-char hex hash...", id="manual-input")
             with Horizontal(id="button-row"):
                 yield Button("Connect Selected", variant="success", id="btn-connect-sel")
                 yield Button("Connect Manual", variant="primary", id="btn-connect-manual")
@@ -725,7 +739,8 @@ class HostSelectorModal(ModalScreen[str]):
     def on_mount(self) -> None:
         table = self.query_one("#hosts-table", DataTable)
         table.cursor_type = "row"
-        table.add_columns("Alias / Hash", "Hops", "Load", "Type", "Score", "Age", "Reachable", "Channels")
+        table.add_columns("Alias / Hash", "Hops", "Load", "Type", "Score", "Affinity", "Age", "Reachable", "Channels")
+        table.zebra_stripes = True
         self.refresh_table()
 
     def _extract_channel_summary(self, host: dict) -> bytes | None:
@@ -767,11 +782,12 @@ class HostSelectorModal(ModalScreen[str]):
             except Exception:
                 reachable = "?"
             table.add_row(
-                h.get("alias"),
+                f"{h.get('alias') or 'Unknown'}",
                 str(h.get("hops")),
                 load_str,
                 h_type,
-                str(h.get("score")),
+                f"{float(h.get('score', 0.0)):.2f}",
+                str(h.get("channel_affinity", 0)),
                 age_str,
                 reachable,
                 channel_count_str,
@@ -1188,7 +1204,8 @@ class RetiSpeakeasyApp(App):
     #main-area { width: 1fr; height: 100%; layout: vertical; }
     #channel-tabs { height: 1fr; }
     .widget-header { background: $accent; color: $text; text-style: bold; padding: 0 1; width: 100%; margin-top: 1; }
-    #chat-input { width: 100%; dock: bottom; }
+    .status-pill { background: $boost; color: $text; padding: 0 1; width: 100%; margin-top: 1; }
+    #chat-input { width: 100%; dock: bottom; margin-top: 1; }
     .sidebar-btn { width: 100%; margin-top: 1; }
     .chat-log { height: 1fr; border: solid $secondary; background: $surface-darken-1; }
     #system-log { height: 1fr; border: solid $secondary; background: $surface-darken-1; min-height: 8; }
@@ -1223,10 +1240,10 @@ class RetiSpeakeasyApp(App):
         with Horizontal():
             with Vertical(id="sidebar"):
                 yield Label(" Node Identity", classes="widget-header")
-                yield Label("Hash:", id="hash-title")
-                yield Label("Initializing...", id="hash-label")
+                yield Label("Public key fingerprint", id="hash-title")
+                yield Label("Initializing...", id="hash-label", classes="status-pill")
                 yield Label(" Connected Host", classes="widget-header")
-                yield Label("None", id="host-label")
+                yield Label("None", id="host-label", classes="status-pill")
                 yield Button(" Select Host (H)", id="btn-host-open", classes="sidebar-btn", variant="primary")
                 yield Button(" Edit Profile (P)", id="btn-profile-open", classes="sidebar-btn", variant="default")
                 yield Button(" New Bulletin (B)", id="btn-bulletin-open", classes="sidebar-btn", variant="success")
@@ -1268,11 +1285,13 @@ class RetiSpeakeasyApp(App):
 
         bbs_table = self.query_one("#bbs-table", DataTable)
         bbs_table.cursor_type = "row"
+        bbs_table.zebra_stripes = True
         bbs_table.add_columns("Title", "Author", "Date")
 
         for calendar_table in self.query("DataTable"):
             if getattr(calendar_table, "id", "").startswith("calendar-table-"):
                 calendar_table.cursor_type = "row"
+                calendar_table.zebra_stripes = True
                 if not calendar_table.columns:
                     calendar_table.add_columns("Title", "When", "Location", "Owner")
 
@@ -1748,6 +1767,7 @@ class RetiSpeakeasyApp(App):
                     sys_log = self.query_one("#system-log", RichLog)
                     # Engine messages carry their own Rich markup.
                     sys_log.write(f"[bold yellow]Sys:[/] {data}")
+                    sys_log.scroll_end(animate=False)
                 except Exception:
                     pass
             elif event_type == "refresh_chat":

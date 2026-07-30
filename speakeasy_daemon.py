@@ -121,6 +121,7 @@ class SpeakeasyDaemon:
         self.operator_bootstrap_pending = False
         self.operator_bootstrap_retry_at = 0.0
         self.channel_presence_cache: dict[tuple[str, str], bool] = {}
+        self.peer_channel_cache: dict[str, set[str]] = {}
 
         node_cfg = self.config.get("node", {})
         fed_cfg = self.config.get("federation", {})
@@ -382,10 +383,36 @@ class SpeakeasyDaemon:
             return remote.hash.hex()
         return str(id(link))
 
+    def _channel_affinity_score(self, peer_key: str) -> int:
+        peer_channels = getattr(self, "peer_channel_cache", {}).get(peer_key, set())
+        local_channels = set(self.db.get_active_channel_names()) if self.db else set()
+        if not peer_channels or not local_channels:
+            return 0
+        return len(local_channels & peer_channels)
+
     def _remember_channel_presence(self, channel_name: str, link, present: bool) -> None:
         if not channel_name:
             return
         self.channel_presence_cache[(str(channel_name).lstrip("#"), self._peer_key(link))] = bool(present)
+        if bool(present):
+            peer_key = self._peer_key(link)
+            cache = getattr(self, "peer_channel_cache", None)
+            if cache is None:
+                self.peer_channel_cache = {}
+                cache = self.peer_channel_cache
+            cache.setdefault(peer_key, set()).add(str(channel_name).lstrip("#"))
+
+    def _remember_peer_channels(self, link, channels) -> None:
+        peer_key = self._peer_key(link)
+        if not peer_key:
+            return
+        normalized = {str(c).lstrip("#") for c in channels or () if c}
+        if normalized:
+            cache = getattr(self, "peer_channel_cache", None)
+            if cache is None:
+                self.peer_channel_cache = {}
+                cache = self.peer_channel_cache
+            cache[peer_key] = set(cache.get(peer_key, set())) | normalized
 
     def _on_remote_identified(self, link, remote_identity):
         if remote_identity and blackhole.is_blocked(remote_identity.hash, self.db):
@@ -456,6 +483,8 @@ class SpeakeasyDaemon:
                 channel_name = str(payload.get(0) or payload.get("0") or "")
                 present = bool(payload.get(1) or payload.get("1") or False)
                 self._remember_channel_presence(channel_name, packet.link, present)
+            elif getattr(result, "hello_channels", None):
+                self._remember_peer_channels(packet.link, result.hello_channels)
 
             peer_count = self._broadcast(relay_frames, exclude_link=packet.link)
             if peer_count and relay_frames:
@@ -780,12 +809,17 @@ class SpeakeasyDaemon:
         if not self.auto_discover_peers:
             return
 
+        ranked_peers = []
         for peer_hex, identity in list(self.discovered_peers.items()):
             if len(self.active_links) >= self.max_clients:
                 logger.info("At link capacity; deferring discovered peer connections.")
                 return
             if self._is_connected_to(identity) or blackhole.is_blocked(identity.hash, self.db):
                 continue
+            ranked_peers.append((self._channel_affinity_score(peer_hex), peer_hex, identity))
+
+        ranked_peers.sort(key=lambda item: (-item[0], item[1]))
+        for _, peer_hex, identity in ranked_peers:
             try:
                 self._link_to(identity, peer_hex)
             except Exception as e:

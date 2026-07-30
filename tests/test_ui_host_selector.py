@@ -79,6 +79,24 @@ def test_host_selector_populates_table(monkeypatch):
     assert fake_table.row_count == 2
 
 
+def test_host_selector_shows_affinity_count():
+    hm = HostManager(
+        db=SimpleNamespace(get_active_channel_names=lambda: ["general", "tech"]),
+        probe_interval=300,
+        probes_per_round=1,
+    )
+    host = {
+        "hex_hash": "11" * 16,
+        "alias": "TechHub",
+        "metadata": {"channels": ["general", "tech"], "chc": 2},
+    }
+    hm.hosts[host["hex_hash"]] = host
+
+    ranked = hm.get_ranked_hosts()
+
+    assert ranked[0]["channel_affinity"] == 2
+
+
 def test_host_selector_channel_filter_uses_summary():
     hm = HostManager(db=None, probe_interval=300, probes_per_round=1)
     with_tech = {
