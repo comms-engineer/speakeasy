@@ -16,7 +16,7 @@ from textual.widgets import Button, DataTable, Footer, Header, Input, Label, Ric
 
 import blackhole
 from fed_engine import MAX_MESSAGE_CONTENT_BYTES, Opcode, S2SProtocolEngine
-from speakeasy_db import BandwidthClass, SpeakeasyDB
+from speakeasy_db import BandwidthClass, Calendar, Event, SpeakeasyDB
 
 APP_NAME = "speakeasy"
 ASPECT_HOST = "host"
@@ -313,6 +313,62 @@ class BulletinPostModal(ModalScreen[dict]):
             self.dismiss({
                 "title": self.query_one("#input-title", Input).value.strip(),
                 "body": self.query_one("#input-body", TextArea).text.strip(),
+            })
+        else:
+            self.dismiss(None)
+
+
+class CalendarEventModal(ModalScreen[dict]):
+    BINDINGS = [("escape", "dismiss_modal", "Cancel / Close")]
+
+    def __init__(self, channel: str, current_event: Event | None = None):
+        super().__init__()
+        self.channel = channel
+        self.current_event = current_event
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="dialog"):
+            yield Label(" Create / Edit Calendar Event", id="modal-title")
+            yield Label("Title:", classes="field-label")
+            yield Input(value=self.current_event.title if self.current_event else "", id="input-title")
+            yield Label("Location:", classes="field-label")
+            yield Input(value=self.current_event.location if self.current_event else "", id="input-location")
+            yield Label("Description:", classes="field-label")
+            yield TextArea(self.current_event.description or "" if self.current_event else "", id="input-description")
+            yield Label("Start (Unix timestamp):", classes="field-label")
+            yield Input(value=str(self.current_event.start_at) if self.current_event else "", id="input-start")
+            yield Label("End (Unix timestamp):", classes="field-label")
+            yield Input(value=str(self.current_event.end_at) if self.current_event else "", id="input-end")
+            with Horizontal(id="button-row"):
+                yield Button("Save Event", variant="success", id="btn-save")
+                yield Button("Cancel [Esc]", variant="error", id="btn-cancel")
+
+    def action_dismiss_modal(self) -> None:
+        self.dismiss(None)
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        if event.button.id == "btn-save":
+            title = self.query_one("#input-title", Input).value.strip()
+            location = self.query_one("#input-location", Input).value.strip()
+            description = self.query_one("#input-description", TextArea).text.strip()
+            start_value = self.query_one("#input-start", Input).value.strip()
+            end_value = self.query_one("#input-end", Input).value.strip()
+            if not title or not start_value or not end_value:
+                self.notify("Title, start time, and end time are required.", severity="error")
+                return
+            try:
+                start_at = int(start_value)
+                end_at = int(end_value)
+            except ValueError:
+                self.notify("Start and end times must be Unix timestamps.", severity="error")
+                return
+            self.dismiss({
+                "title": title,
+                "location": location or None,
+                "description": description or None,
+                "start_at": start_at,
+                "end_at": end_at,
+                "channel": self.channel,
             })
         else:
             self.dismiss(None)
@@ -808,6 +864,9 @@ class RetiSpeakeasyApp(App):
     #bbs-table { height: 10; margin-bottom: 1; }
     #bbs-viewer { height: 1fr; border: solid $accent; background: $surface-darken-1; }
     #bbs-top-bar { height: 3; align: right middle; margin-bottom: 1; }
+    #calendar-pane { height: 12; border: solid $secondary; background: $surface-darken-1; padding: 1; margin-top: 1; }
+    #calendar-controls { height: 3; align: left middle; margin-bottom: 1; }
+    #calendar-table { height: 8; margin-bottom: 1; }
     """
 
     BINDINGS = [
@@ -816,6 +875,7 @@ class RetiSpeakeasyApp(App):
         ("p", "show_profile_modal", "Edit Profile"),
         ("b", "show_bulletin_modal", "New Bulletin"),
         ("n", "show_channel_request_modal", "Request Channel"),
+        ("c", "show_calendar_modal", "Calendar Event"),
     ]
 
     def compose(self) -> ComposeResult:
@@ -836,6 +896,7 @@ class RetiSpeakeasyApp(App):
                 yield Button(" Edit Profile (P)", id="btn-profile-open", classes="sidebar-btn", variant="default")
                 yield Button(" New Bulletin (B)", id="btn-bulletin-open", classes="sidebar-btn", variant="success")
                 yield Button(" Request Channel (N)", id="btn-channel-open", classes="sidebar-btn", variant="warning")
+                yield Button(" New Calendar Event (C)", id="btn-calendar-open", classes="sidebar-btn", variant="primary")
                 yield Label(" System Log", classes="widget-header")
                 yield RichLog(id="system-log", classes="chat-log", highlight=True, markup=True)
             with Vertical(id="main-area"):
@@ -845,6 +906,15 @@ class RetiSpeakeasyApp(App):
                         clean_id = chan_name.lstrip('#')
                         with TabPane(f"#{clean_id}", id=f"tab-{clean_id}"):
                             yield RichLog(id=f"log-{clean_id}", classes="chat-log", highlight=True, markup=True)
+                    with TabPane(" Calendar", id="tab-calendar"):
+                        with Vertical(id="calendar-pane"):
+                            yield Label(" Channel Calendar", classes="widget-header")
+                            with Horizontal(id="calendar-controls"):
+                                yield Button(" New", id="btn-calendar-new", variant="success")
+                                yield Button(" Edit", id="btn-calendar-edit", variant="primary")
+                                yield Button(" Delete", id="btn-calendar-delete", variant="error")
+                            yield DataTable(id="calendar-table")
+                            yield RichLog(id="calendar-log", classes="chat-log", highlight=True, markup=True)
                     with TabPane(" Bulletin Board", id="tab-bbs"):
                         with Vertical(id="bbs-container"):
                             with Horizontal(id="bbs-top-bar"):
@@ -863,8 +933,13 @@ class RetiSpeakeasyApp(App):
         bbs_table.cursor_type = "row"
         bbs_table.add_columns("Title", "Author", "Date")
 
+        calendar_table = self.query_one("#calendar-table", DataTable)
+        calendar_table.cursor_type = "row"
+        calendar_table.add_columns("Title", "When", "Location", "Owner")
+
         self.reload_all_chat_logs()
         self.reload_bulletin_board()
+        self.reload_calendar_events()
 
     def get_current_channel(self) -> str:
         tabs = self.query_one("#channel-tabs", TabbedContent)
@@ -986,6 +1061,115 @@ class RetiSpeakeasyApp(App):
 
         self.push_screen(BulletinPostModal(), handle_bulletin)
 
+    def _ensure_calendar_exists(self, channel: str):
+        db = self.engine.db
+        calendar = db.get_calendar(channel)
+        if calendar is None:
+            db.create_calendar(Calendar(
+                calendar_id=channel,
+                name=f"{channel} Calendar",
+                description=f"Events for #{channel}",
+                owner_hash=self.engine.identity.hash.hex(),
+                visibility="public",
+                timezone="UTC",
+                channel=channel,
+                created_at=int(time.time()),
+                updated_at=int(time.time()),
+            ))
+            calendar = db.get_calendar(channel)
+        return calendar
+
+    def action_show_calendar_modal(self, current_event: Event | None = None) -> None:
+        channel = self.get_current_channel()
+
+        def handle_calendar(data: dict | None) -> None:
+            if not data:
+                return
+            db = self.engine.db
+            calendar = self._ensure_calendar_exists(channel)
+            if calendar is None:
+                self.notify("Unable to initialize the calendar for this channel.", severity="error")
+                return
+            if current_event is None:
+                event = Event(
+                    event_id=f"evt-{int(time.time() * 1000)}",
+                    calendar_id=calendar.calendar_id,
+                    title=data["title"],
+                    description=data.get("description"),
+                    location=data.get("location"),
+                    start_at=int(data["start_at"]),
+                    end_at=int(data["end_at"]),
+                    all_day=False,
+                    status="scheduled",
+                    channel=channel,
+                    created_by_hash=self.engine.identity.hash.hex(),
+                    created_at=int(time.time()),
+                    updated_at=int(time.time()),
+                )
+                db.create_event(event)
+                self.notify(f"Event added for #{channel}.")
+            else:
+                updated = Event(
+                    event_id=current_event.event_id,
+                    calendar_id=current_event.calendar_id,
+                    title=data["title"],
+                    description=data.get("description"),
+                    location=data.get("location"),
+                    start_at=int(data["start_at"]),
+                    end_at=int(data["end_at"]),
+                    all_day=current_event.all_day,
+                    status=current_event.status,
+                    channel=current_event.channel,
+                    created_by_hash=current_event.created_by_hash,
+                    created_at=current_event.created_at,
+                    updated_at=int(time.time()),
+                    deleted_at=current_event.deleted_at,
+                    revision=current_event.revision,
+                )
+                if not db.update_event(updated, self.engine.identity.hash.hex()):
+                    self.notify("You can only edit events you created or own.", severity="error")
+                    return
+                self.notify(f"Event updated for #{channel}.")
+            self.reload_calendar_events()
+
+        self.push_screen(CalendarEventModal(channel=channel, current_event=current_event), handle_calendar)
+
+    def reload_calendar_events(self) -> None:
+        channel = self.get_current_channel()
+        try:
+            calendar_log = self.query_one("#calendar-log", RichLog)
+            calendar_table = self.query_one("#calendar-table", DataTable)
+        except Exception:
+            return
+
+        calendar_log.clear()
+        calendar_table.clear()
+        events = self.engine.db.list_events_for_channel(channel)
+        if not events:
+            calendar_log.write(f"No calendar events yet for #{channel}.")
+            return
+
+        for event in events:
+            ts = datetime.datetime.fromtimestamp(event.start_at).strftime("%Y-%m-%d %H:%M")
+            calendar_log.write(
+                f"[bold cyan]{escape(event.title)}[/] — {escape(ts)} — {escape(event.location or 'TBD')}"
+            )
+            owner = event.created_by_hash[:10] if event.created_by_hash else "unknown"
+            calendar_table.add_row(event.title, ts, event.location or "TBD", owner, key=event.event_id)
+
+    def _selected_calendar_event(self) -> Event | None:
+        try:
+            table = self.query_one("#calendar-table", DataTable)
+        except Exception:
+            return None
+        if table.cursor_row is None:
+            return None
+        row_key = table.get_row_at(table.cursor_row)
+        event_id = row_key[0] if isinstance(row_key, tuple) else None
+        if not event_id:
+            return None
+        return self.engine.db.get_event(str(event_id))
+
     def on_button_pressed(self, event: Button.Pressed) -> None:
         if event.button.id == "btn-host-open":
             self.action_show_host_modal()
@@ -995,6 +1179,26 @@ class RetiSpeakeasyApp(App):
             self.action_show_bulletin_modal()
         elif event.button.id == "btn-channel-open":
             self.action_show_channel_request_modal()
+        elif event.button.id == "btn-calendar-open":
+            self.action_show_calendar_modal()
+        elif event.button.id == "btn-calendar-new":
+            self.action_show_calendar_modal()
+        elif event.button.id == "btn-calendar-edit":
+            selected = self._selected_calendar_event()
+            if selected:
+                self.action_show_calendar_modal(current_event=selected)
+            else:
+                self.notify("Select an event first.", severity="warning")
+        elif event.button.id == "btn-calendar-delete":
+            selected = self._selected_calendar_event()
+            if not selected:
+                self.notify("Select an event first.", severity="warning")
+                return
+            if self.engine.db.delete_event(selected.event_id, self.engine.identity.hash.hex()):
+                self.notify("Event deleted.")
+                self.reload_calendar_events()
+            else:
+                self.notify("You can only delete events you created or own.", severity="error")
 
     def handle_command(self, text: str) -> None:
         command, _, argument = text[1:].partition(" ")
@@ -1026,6 +1230,8 @@ class RetiSpeakeasyApp(App):
                 self.reload_all_chat_logs()
             elif event_type == "refresh_bbs":
                 self.reload_bulletin_board()
+            elif event_type == "refresh_calendar":
+                self.reload_calendar_events()
             elif event_type == "channels_updated":
                 self.sync_channel_tabs(data or [])
             elif event_type == "host_updated":

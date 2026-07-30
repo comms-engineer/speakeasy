@@ -829,6 +829,9 @@ class SpeakeasyDB(CalendarStore):
                     ("general", "General discussion channel", time.time())
                 )
 
+            # Create the calendar tables used by the community calendar feature.
+            create_calendar_tables(self._conn)
+
     # ----------------------------------------------------------------------
     # Identity & Profile Management
     # ----------------------------------------------------------------------

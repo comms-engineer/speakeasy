@@ -1,6 +1,11 @@
 import sqlite3
+from types import SimpleNamespace
+from unittest.mock import patch
 
-from speakeasy_db import Calendar, Event, create_calendar_tables
+from textual.app import App
+
+from reti_speakeasy import RetiSpeakeasyApp
+from speakeasy_db import Calendar, Event, SpeakeasyDB, create_calendar_tables
 
 
 def test_calendar_schema_creates_tables(tmp_path):
@@ -17,6 +22,55 @@ def test_calendar_schema_creates_tables(tmp_path):
         assert tables == {"calendar", "event", "event_change"}
     finally:
         connection.close()
+
+
+def test_calendar_ui_components_are_present():
+    app = RetiSpeakeasyApp()
+
+    async def check_components() -> None:
+        async with app.run_test():
+            widget_ids = {
+                widget.id
+                for widget in app.query("*")
+                if getattr(widget, "id", None)
+            }
+            assert "btn-calendar-open" in widget_ids
+            assert "tab-calendar" in widget_ids
+            assert "calendar-log" in widget_ids
+
+    App.run_test = App.run_test
+    import asyncio
+    asyncio.run(check_components())
+
+
+def test_calendar_tui_supports_edit_and_delete_controls():
+    app = RetiSpeakeasyApp()
+
+    def fake_engine_init(self, ui_callback=None):
+        self.ui_callback = ui_callback
+        self.hash_str = "test-hash"
+        self.db = SpeakeasyDB(":memory:")
+        self.identity = SimpleNamespace(hash=SimpleNamespace(hex=lambda: "test-identity"))
+        self.host_manager = None
+        self.active_host_link = None
+        self.s2s_engine = None
+        self.host_channels = set()
+
+    async def check_components() -> None:
+        with patch("reti_speakeasy.ReticulumEngine.__init__", fake_engine_init):
+            async with app.run_test():
+                widget_ids = {
+                    widget.id
+                    for widget in app.query("*")
+                    if getattr(widget, "id", None)
+                }
+                assert "calendar-table" in widget_ids
+                assert "btn-calendar-new" in widget_ids
+                assert "btn-calendar-edit" in widget_ids
+                assert "btn-calendar-delete" in widget_ids
+
+    import asyncio
+    asyncio.run(check_components())
 
 
 def test_calendar_and_event_models_round_trip():
