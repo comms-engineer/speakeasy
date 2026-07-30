@@ -907,10 +907,22 @@ class SpeakeasyDB:
             """, (str(hex_hash), alias, hops, load, max_load, last_seen, is_manual, score))
         return True
 
-    def get_known_hosts(self) -> List[Dict[str, Any]]:
+    def save_host(self, host: Dict[str, Any]) -> bool:
+        return self.upsert_known_host(host)
+
+    def load_hosts(self, limit: int = 100) -> List[Dict[str, Any]]:
         with self._tx() as cursor:
-            cursor.execute("SELECT * FROM known_hosts ORDER BY score DESC, last_seen DESC")
-            return [dict(row) for row in cursor.fetchall()]
+            cursor.execute("SELECT * FROM known_hosts ORDER BY score DESC, last_seen DESC LIMIT ?", (int(limit),))
+            rows = []
+            for row in cursor.fetchall():
+                entry = dict(row)
+                entry["hex_hash"] = entry.get("hex_hash")
+                entry["is_manual"] = bool(entry.get("is_manual", 0))
+                rows.append(entry)
+            return rows
+
+    def get_known_hosts(self) -> List[Dict[str, Any]]:
+        return self.load_hosts(limit=500)
 
     def resolve_identity(self, needle: str) -> Optional[str]:
         """
