@@ -1276,28 +1276,29 @@ class RetiSpeakeasyApp(App):
                 pane = None
 
             if pane is None:
-                tabs.add_pane(TabPane(
-                    f"#{clean_id}",
-                    RichLog(id=f"log-{clean_id}", classes="chat-log", highlight=True, markup=True),
-                    Vertical(
-                        Vertical(
-                            Label(f" {clean_id} Calendar", classes="widget-header"),
-                            Horizontal(classes="channel-calendar-controls")(
-                                Button(" New", id=f"btn-calendar-new-{clean_id}", variant="success"),
-                                Button(" Edit", id=f"btn-calendar-edit-{clean_id}", variant="primary"),
-                                Button(" Delete", id=f"btn-calendar-delete-{clean_id}", variant="error"),
-                            ),
-                            DataTable(id=f"calendar-table-{clean_id}"),
-                            RichLog(id=f"calendar-log-{clean_id}", classes="chat-log", highlight=True, markup=True),
-                            id=f"calendar-pane-{clean_id}",
-                        ),
-                    ),
-                    id=f"tab-{clean_id}",
-                ))
+                pane = TabPane(f"#{clean_id}", id=f"tab-{clean_id}")
+                tabs.add_pane(pane)
+
+                pane.mount(RichLog(id=f"log-{clean_id}", classes="chat-log", highlight=True, markup=True))
+                calendar_pane = Vertical(classes="channel-calendar-pane", id=f"calendar-pane-{clean_id}")
+                pane.mount(calendar_pane)
+                calendar_pane.mount(Label(f" {clean_id} Calendar", classes="widget-header"))
+
+                calendar_controls = Horizontal(classes="channel-calendar-controls")
+                calendar_pane.mount(calendar_controls)
+                calendar_controls.mount(Button(" New", id=f"btn-calendar-new-{clean_id}", variant="success"))
+                calendar_controls.mount(Button(" Edit", id=f"btn-calendar-edit-{clean_id}", variant="primary"))
+                calendar_controls.mount(Button(" Delete", id=f"btn-calendar-delete-{clean_id}", variant="error"))
+
+                calendar_pane.mount(DataTable(id=f"calendar-table-{clean_id}"))
+                calendar_pane.mount(RichLog(id=f"calendar-log-{clean_id}", classes="chat-log", highlight=True, markup=True))
 
             try:
                 pane = self.query_one(f"#tab-{clean_id}", TabPane)
                 pane.display = clean_id in visible
+                calendar_table = self.query_one(f"#calendar-table-{clean_id}", DataTable)
+                if not calendar_table.columns:
+                    calendar_table.add_columns("Title", "When", "Location", "Owner")
             except Exception:
                 pass
 
@@ -1343,7 +1344,7 @@ class RetiSpeakeasyApp(App):
 
     def action_show_local_channel_purge_modal(self) -> None:
         channels = [
-            ch for ch in self.engine.db.get_channels()
+            ch for ch in self.engine.db.get_channels_with_local_data()
             if str(ch.get("name") or "").strip().lower() != "bbs"
         ]
         if not channels:

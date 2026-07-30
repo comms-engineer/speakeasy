@@ -183,6 +183,63 @@ def test_purge_channel_removes_tab_from_ui(tmp_path):
     asyncio.run(check_purge_removes_tab())
 
 
+def test_sync_channel_tabs_adds_dynamic_channel_without_widget_errors(tmp_path):
+    app = RetiSpeakeasyApp()
+    db_path = tmp_path / "client-dynamic-tabs.db"
+    host_hash = "ef" * 16
+
+    def fake_engine_init(self, ui_callback=None):
+        self.ui_callback = ui_callback
+        self.hash_str = "test-hash"
+        self.db = SpeakeasyDB(str(db_path))
+        self.identity = SimpleNamespace(hash=SimpleNamespace(hex=lambda: "test-identity"))
+        self.host_manager = None
+        self.active_host_link = None
+        self.s2s_engine = None
+        self.host_channels = {"general", "test2"}
+        self.current_host_hash = host_hash
+
+    async def check_dynamic_add() -> None:
+        with patch("reti_speakeasy.ReticulumEngine.__init__", fake_engine_init), \
+             patch("reti_speakeasy.client_db_path", return_value=str(db_path)):
+            startup_db = SpeakeasyDB(str(db_path))
+            startup_db.add_channel("general", "Channel #general")
+            startup_db.close()
+
+            async with app.run_test() as pilot:
+                app.sync_channel_tabs(["general", "test2"])
+                await pilot.pause()
+                assert len(list(app.query("#tab-test2"))) == 1
+                assert len(list(app.query("#calendar-table-test2"))) == 1
+
+    import asyncio
+    asyncio.run(check_dynamic_add())
+
+
+def test_get_channels_with_local_data_excludes_empty_channels(tmp_path):
+    db = SpeakeasyDB(str(tmp_path / "purge-candidates.db"))
+    try:
+        db.add_channel("withdata", "Channel #withdata")
+        db.add_channel("empty", "Channel #empty")
+        db.create_calendar(Calendar(
+            calendar_id="withdata",
+            name="With Data",
+            description="",
+            owner_hash="owner-1",
+            visibility="public",
+            timezone="UTC",
+            channel="withdata",
+            created_at=1710000000,
+            updated_at=1710000000,
+        ))
+
+        names = [row["name"] for row in db.get_channels_with_local_data()]
+        assert "withdata" in names
+        assert "empty" not in names
+    finally:
+        db.close()
+
+
 def test_calendar_and_event_models_round_trip():
     calendar = Calendar(
         calendar_id="cal-001",

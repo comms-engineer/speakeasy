@@ -1564,6 +1564,26 @@ class SpeakeasyDB(CalendarStore):
             cursor.execute("SELECT * FROM channels ORDER BY name ASC")
             return [dict(row) for row in cursor.fetchall()]
 
+    def get_channels_with_local_data(self) -> List[Dict[str, Any]]:
+        """Channel rows that currently have local per-channel artifacts.
+
+        Used by the client purge UI so channels already purged (and only later
+        re-advertised by a hub) do not reappear unless new local data exists.
+        """
+        with self._tx() as cursor:
+            cursor.execute(
+                """
+                SELECT c.*
+                FROM channels c
+                WHERE EXISTS (SELECT 1 FROM messages m WHERE m.channel = c.name)
+                   OR EXISTS (SELECT 1 FROM event e WHERE e.channel = c.name)
+                   OR EXISTS (SELECT 1 FROM calendar cal WHERE cal.channel = c.name OR cal.calendar_id = c.name)
+                   OR EXISTS (SELECT 1 FROM channel_requests r WHERE r.name = c.name)
+                ORDER BY c.name ASC
+                """
+            )
+            return [dict(row) for row in cursor.fetchall()]
+
     def get_active_channel_names(self) -> List[str]:
         """Channel names currently hosted for traffic and federation."""
         with self._tx() as cursor:
