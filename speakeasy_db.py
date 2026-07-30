@@ -700,7 +700,14 @@ class SpeakeasyDB(CalendarStore):
 
     def close(self):
         with self._lock:
-            self._conn.close()
+            if getattr(self, "_conn", None) is None:
+                return
+            try:
+                self._conn.close()
+            except Exception:
+                pass
+            finally:
+                self._conn = None
 
     def epoch_for(self, timestamp: float) -> int:
         return int(float(timestamp) // self.epoch_bucket_sec)

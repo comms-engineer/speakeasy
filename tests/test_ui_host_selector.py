@@ -1,3 +1,4 @@
+import sqlite3
 from types import SimpleNamespace
 from channel_summary import build_channel_summary
 from reti_speakeasy import HostSelectorModal, HostManager
@@ -95,6 +96,24 @@ def test_host_selector_shows_affinity_count():
     ranked = hm.get_ranked_hosts()
 
     assert ranked[0]["channel_affinity"] == 2
+
+
+def test_host_manager_tolerates_closed_db_during_ranking():
+    class ClosedDB:
+        def get_active_channel_names(self):
+            raise sqlite3.ProgrammingError("Cannot operate on a closed database")
+
+    hm = HostManager(db=ClosedDB(), probe_interval=300, probes_per_round=1)
+    host = {
+        "hex_hash": "33" * 16,
+        "alias": "ClosedDBHost",
+        "metadata": {"channels": ["general"], "chc": 1},
+    }
+    hm.hosts[host["hex_hash"]] = host
+
+    ranked = hm.get_ranked_hosts()
+
+    assert ranked[0]["channel_affinity"] == 0
 
 
 def test_host_selector_channel_filter_uses_summary():

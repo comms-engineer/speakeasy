@@ -260,7 +260,12 @@ class HostManager:
     def get_ranked_hosts(self) -> list:
         now = time.time()
         ranked = []
-        local_channels = set(self.db.get_active_channel_names()) if self.db else set()
+        local_channels = set()
+        if self.db:
+            try:
+                local_channels = set(self.db.get_active_channel_names())
+            except Exception:
+                local_channels = set()
         for host in list(self.hosts.values()):
             # Keep previously discovered hosts visible to the UI and the caller.
             # Stale-host cleanup is handled by the DB layer separately so this
